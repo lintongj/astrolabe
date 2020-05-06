@@ -18,19 +18,22 @@ package ivd
 
 import (
 	"context"
-	"fmt"
-	"github.com/pkg/errors"
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/sirupsen/logrus"
+	"github.com/vmware-tanzu/astrolabe/pkg/astrolabe"
+	"github.com/vmware-tanzu/astrolabe/pkg/s3repository"
 	"github.com/vmware/govmomi/cns"
 	cnstypes "github.com/vmware/govmomi/cns/types"
 	vim25types "github.com/vmware/govmomi/vim25/types"
-	"k8s.io/client-go/rest"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 	"net/url"
 	"os"
 	"strings"
 	"testing"
 	"time"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 func TestProtectedEntityTypeManager(t *testing.T) {
@@ -50,56 +53,6 @@ func TestProtectedEntityTypeManager(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("# of PEs returned = %d\n", len(pes))
-}
-
-func getVcConfigFromParams(params map[string]interface{}) (*url.URL, bool, error) {
-	var vcUrl url.URL
-	vcUrl.Scheme = "https"
-	vcHostStr, ok := params["VirtualCenter"].(string)
-	if !ok {
-		return nil, false, errors.New("Missing vcHost param")
-	}
-	vcHostPortStr, ok := params["port"].(string)
-	if !ok {
-		return nil, false, errors.New("Missing port param")
-	}
-
-	vcUrl.Host = fmt.Sprintf("%s:%s", vcHostStr, vcHostPortStr)
-
-	vcUser, ok := params["user"].(string)
-	if !ok {
-		return nil, false, errors.New("Missing vcUser param")
-	}
-	vcPassword, ok := params["password"].(string)
-	if !ok {
-		return nil, false, errors.New("Missing vcPassword param")
-	}
-	vcUrl.User = url.UserPassword(vcUser, vcPassword)
-	vcUrl.Path = "/sdk"
-
-	insecure := false
-	insecureStr, ok := params["insecure-flag"].(string)
-	if ok && (insecureStr == "TRUE" || insecureStr == "true") {
-		insecure = true
-	}
-
-	return &vcUrl, insecure, nil
-}
-
-func getVcUrlFromConfig(config *rest.Config) (*url.URL, bool, error) {
-	params := make(map[string]interface{})
-
-	err := retrievePlatformInfoFromConfig(config, params, nil)
-	if err != nil {
-		return nil, false, errors.Errorf("Failed to retrieve VC config secret: %+v", err)
-	}
-
-	vcUrl, insecure, err := getVcConfigFromParams(params)
-	if err != nil {
-		return nil, false, errors.Errorf("Failed to get VC config from params: %+v", err)
-	}
-
-	return vcUrl, insecure, nil
 }
 
 func verifyMdIsRestoredAsExpected(md metadata, version string, logger logrus.FieldLogger) bool {
@@ -155,16 +108,16 @@ func TestCreateCnsVolume(t *testing.T) {
 		t.Fatalf("Failed to build k8s config from kubeconfig file: %+v ", err)
 	}
 
+	logger := logrus.New()
+	logger.SetLevel(logrus.DebugLevel)
+
 	ctx := context.Background()
 
 	// Step 1: To create the IVD PETM, get all PEs and select one as the reference.
-	vcUrl, insecure, err := getVcUrlFromConfig(config)
+	vcUrl, insecure, err := GetVcUrlFromConfig(config, logger)
 	if err != nil {
 		t.Fatalf("Failed to get VC config from params: %+v", err)
 	}
-
-	logger := logrus.New()
-	logger.SetLevel(logrus.DebugLevel)
 
 	ivdPETM, err := NewIVDProtectedEntityTypeManagerFromURL(vcUrl, "/ivd", insecure, logger)
 	if err != nil {
@@ -285,16 +238,16 @@ func TestRestoreCnsVolumeFromSnapshot(t *testing.T) {
 		t.Fatalf("Failed to build k8s config from kubeconfig file: %+v ", err)
 	}
 
+	logger := logrus.New()
+	logger.SetLevel(logrus.DebugLevel)
+
 	ctx := context.Background()
 
 	// Step 1: To create the IVD PETM, get all PEs and select one as the reference.
-	vcUrl, insecure, err := getVcUrlFromConfig(config)
+	vcUrl, insecure, err := GetVcUrlFromConfig(config, logger)
 	if err != nil {
 		t.Fatalf("Failed to get VC config from params: %+v", err)
 	}
-
-	logger := logrus.New()
-	logger.SetLevel(logrus.DebugLevel)
 
 	ivdPETM, err := NewIVDProtectedEntityTypeManagerFromURL(vcUrl, "/ivd", insecure, logger)
 	if err != nil {
@@ -414,4 +367,220 @@ func TestRestoreCnsVolumeFromSnapshot(t *testing.T) {
 	} else {
 		t.Errorf("Volume metadata is NOT restored as expected")
 	}
+}
+
+func TestDeleteSnapshotOnPodVm(t *testing.T) {
+	path := os.Getenv("KUBECONFIG")
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		// path/to/whatever does not exist
+		t.Skipf("The KubeConfig file, %v, is not exist", path)
+	}
+
+	config, err := clientcmd.BuildConfigFromFlags("", path)
+	if err != nil {
+		t.Skipf("Failed to build k8s config from kubeconfig file: %+v ", err)
+	}
+
+	logger := logrus.New()
+	formatter := new(logrus.TextFormatter)
+	formatter.TimestampFormat = time.RFC3339Nano
+	formatter.FullTimestamp = true
+	logger.SetFormatter(formatter)
+	//logger.SetLevel(logrus.InfoLevel)
+	logger.SetLevel(logrus.DebugLevel)
+
+
+	// Get PV using k8s API
+	clientSet, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		t.Skipf("Failed to get k8s clientSet from the given config: %v", config)
+	}
+
+	ns := "demo"
+	// check if the demo namespace exists
+	_, err = clientSet.CoreV1().Namespaces().Get(ns, metav1.GetOptions{})
+	if err != nil {
+		t.Skipf("The expected app namespace, %v, is not available", ns)
+	}
+
+	// list all PVCs in the demo namespace
+	pvcList, err := clientSet.CoreV1().PersistentVolumeClaims(ns).List(metav1.ListOptions{})
+	if err != nil || len(pvcList.Items) == 0 {
+		t.Skipf("There is no PVC available in the expected app namespace, %v", ns)
+	}
+
+	// pick the PV bound to the very first PVC and extract its volume ID
+	pvVolumeName := pvcList.Items[0].Spec.VolumeName
+	pv, err := clientSet.CoreV1().PersistentVolumes().Get(pvVolumeName, metav1.GetOptions{})
+	if err != nil {
+		t.Skipf("Failed to find a PV attached to the app pod")
+	}
+
+	if pv.Spec.CSI == nil {
+		t.Skipf("Skip non-CSI backed PV")
+	}
+
+	volumeId := pv.Spec.CSI.VolumeHandle
+	logger.Debugf("volumeId = %v", volumeId)
+
+	// create an IVD PETM
+	ctx := context.Background()
+	vcUrl, insecure, err := GetVcUrlFromConfig(config, logger)
+	if err != nil {
+		t.Skipf("Failed to get VC config from params: %+v", err)
+	}
+
+	ivdPETM, err := NewIVDProtectedEntityTypeManagerFromURL(vcUrl, "/ivd", insecure, logger)
+	if err != nil {
+		t.Skipf("Failed to get a new ivd PETM: %+v", err)
+	}
+	version := ivdPETM.client.Version
+
+	logger.Debugf("vcUrl = %v, version = %v", vcUrl, version)
+
+	ivdPE, err:= newIVDProtectedEntity(ivdPETM, newProtectedEntityID(NewIDFromString(volumeId)))
+	if err != nil {
+		t.Skipf("Failed to create ivd protected entity from volume, %v", volumeId)
+	}
+
+	// Create an IVD snapshot
+	peSnapshotId, err := ivdPE.Snapshot(ctx)
+	if err != nil {
+		t.Skipf("Failed to create snapshot on IVD protected entity, %v", ivdPE.id.String())
+	}
+
+	// Delete the snapshot just created
+	_, err = ivdPE.DeleteSnapshot(ctx, peSnapshotId)
+	if err != nil {
+		t.Fatalf("Failed to delete snapshot, %v, from IVD protected entity, %v", peSnapshotId.String(), ivdPE.id.String())
+	}
+}
+
+func setupPETM(typeName string, logger logrus.FieldLogger) (*s3repository.ProtectedEntityTypeManager, error) {
+	sess, err := session.NewSession(&aws.Config{
+		Region: aws.String("us-west-1")},
+	)
+	if err != nil {
+		return nil, err
+	}
+	s3petm, err := s3repository.NewS3RepositoryProtectedEntityTypeManager(typeName, *sess, "velero-plugin-s3-repo",
+		"plugins/vsphere-volumes-repo/", logger)
+	if err != nil {
+		return nil, err
+	}
+	return s3petm, err
+}
+
+func TestCopyIVDProtectedEntity(t *testing.T) {
+	path := os.Getenv("KUBECONFIG")
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		// path/to/whatever does not exist
+		t.Skipf("The KubeConfig file, %v, is not exist", path)
+	}
+
+	config, err := clientcmd.BuildConfigFromFlags("", path)
+	if err != nil {
+		t.Skipf("Failed to build k8s config from kubeconfig file: %+v ", err)
+	}
+
+	// Get PV using k8s API
+	clientSet, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		t.Skipf("Failed to get k8s clientSet from the given config: %v", config)
+	}
+
+	logger := logrus.New()
+	formatter := new(logrus.TextFormatter)
+	formatter.TimestampFormat = time.RFC3339Nano
+	formatter.FullTimestamp = true
+	logger.SetFormatter(formatter)
+	//logger.SetLevel(logrus.InfoLevel)
+	logger.SetLevel(logrus.DebugLevel)
+
+	ctx := context.Background()
+	vcUrl, insecure, err := GetVcUrlFromConfig(config, logger)
+	if err != nil {
+		t.Skipf("Failed to get VC config from params: %v", err)
+	}
+	logger.Debugf("vcUrl = %v", vcUrl)
+	ivdPETM, err := NewIVDProtectedEntityTypeManagerFromURL(vcUrl, "/ivd", insecure, logger)
+	if err != nil {
+		t.Skipf("Failed to get a new ivd PETM: %v", err)
+	}
+
+	s3PETM, err := setupPETM("ivd", logger)
+	if err != nil {
+		t.Skipf("Failed to get a new s3 PETM: %v", err)
+	}
+
+	// find a PV for backup&restore from the app namespace
+	ns := "demo-app"
+	// check if the demo namespace exists
+	_, err = clientSet.CoreV1().Namespaces().Get(ns, metav1.GetOptions{})
+	if err != nil {
+		t.Skipf("The expected app namespace, %v, is not available", ns)
+	}
+
+	// list all PVCs in the demo namespace
+	pvcList, err := clientSet.CoreV1().PersistentVolumeClaims(ns).List(metav1.ListOptions{})
+	if err != nil || len(pvcList.Items) == 0 {
+		t.Skipf("There is no PVC available in the expected app namespace, %v", ns)
+	}
+
+	// pick the PV bound to the very first PVC and extract its volume ID
+	pvVolumeName := pvcList.Items[0].Spec.VolumeName
+	pv, err := clientSet.CoreV1().PersistentVolumes().Get(pvVolumeName, metav1.GetOptions{})
+	if err != nil {
+		t.Skipf("Failed to find a PV attached to the app pod")
+	}
+
+	if pv.Spec.CSI == nil {
+		t.Skipf("Skip non-CSI backed PV")
+	}
+
+	volumeId := pv.Spec.CSI.VolumeHandle
+	logger.Debugf("volumeId = %v", volumeId)
+
+	ivdPEID := astrolabe.NewProtectedEntityID("ivd", volumeId)
+	var snapID astrolabe.ProtectedEntitySnapshotID
+
+	ivdPE, err := ivdPETM.GetProtectedEntity(ctx, ivdPEID)
+	if err != nil {
+		t.Skipf("Failed to get an ivd PE, %v: %v", ivdPE.GetID().String(), err)
+	}
+
+	snapID, err = ivdPE.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("Failed to create a snapshot on ivd PE, %v: %v", ivdPE.GetID().String(), err)
+	}
+	snapPEID := astrolabe.NewProtectedEntityIDWithSnapshotID("ivd", ivdPEID.GetID(), snapID)
+	snapPE, err := ivdPETM.GetProtectedEntity(ctx, snapPEID)
+	if err != nil {
+		t.Fatalf("Failed to get an ivd snapshot PE, %v: %v", snapPE.GetID().String(), err)
+	}
+
+	defer func() {
+		_, err := ivdPE.DeleteSnapshot(ctx, snapID)
+		if err != nil {
+			logger.Errorf("Failed to delete the local snapshot PE, %v: %v", snapPE.GetID().String(), err)
+		} else {
+			logger.Debugf("Local snapshot PE, %v, was cleaned up", snapPE.GetID().String())
+		}
+
+	}()
+
+	s3PE, err := s3PETM.Copy(ctx, snapPE, astrolabe.AllocateNewObject)
+	if err != nil {
+		t.Fatalf("Failed to copy the snapshot PE, %v, to S3: %v", snapPE.GetID().String(), err)
+	}
+	logger.Infof("Backed up the snapshot PE, %v", s3PE.GetID().String())
+
+	defer func() {
+		_, err := s3PE.DeleteSnapshot(ctx, s3PE.GetID().GetSnapshotID())
+		if err != nil {
+			logger.Errorf("Failed to delete the local snapshot PE, %v: %v", snapPE.GetID().String(), err)
+		} else {
+			logger.Debugf("Remote snapshot PE, %v, was cleaned up", s3PE.GetID().String())
+		}
+	}()
 }

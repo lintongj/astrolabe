@@ -14,10 +14,19 @@ import (
 	"github.com/vmware/govmomi/vim25"
 	"github.com/vmware/govmomi/vim25/mo"
 	vim25types "github.com/vmware/govmomi/vim25/types"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"net/url"
+	"regexp"
+	"strconv"
 	"strings"
+)
+
+// vSphere constants
+const (
+	DefaultVcHostPort = "443"
 )
 
 func findDataCenterFromAncestors(ctx context.Context, client *vim25.Client, objectRef vim25types.ManagedObjectReference, logger logrus.FieldLogger) (string, error)  {
@@ -222,28 +231,68 @@ func retrievePlatformInfoFromConfig(config *rest.Config, params map[string]inter
 		return err
 	}
 
-	ns := "kube-system"
-	secretApis := clientSet.CoreV1().Secrets(ns)
+	namespaces := []string{"kube-system", "vmware-system-csi"}
 	vsphere_secret := "vsphere-config-secret"
-	secret, err := secretApis.Get(vsphere_secret, metav1.GetOptions{})
+	var secret *v1.Secret
+	for _, ns := range namespaces {
+		secretApis := clientSet.CoreV1().Secrets(ns)
+
+		secret, err = secretApis.Get(vsphere_secret, metav1.GetOptions{})
+		if err == nil {
+			logger.Infof("Succeeded to get k8s secret, %s, from the namespace, %s", vsphere_secret, ns)
+			break
+		}
+		logger.Debugf("Failed to get k8s secret, %s, from the namespace, %s. Keep trying.", vsphere_secret, ns)
+	}
+
 	if err != nil {
-		logger.WithError(err).Errorf("Failed to get k8s secret, %s", vsphere_secret)
+		logger.Errorf("Failed to find k8s secret, %s, from any of the namespaces, %v", vsphere_secret, namespaces)
 		return err
 	}
-	sEnc := string(secret.Data["csi-vsphere.conf"])
+
+	conf_keys := []string{"csi-vsphere.conf", "vsphere-cloud-provider.conf"}
+	var sEnc string
+	for _, conf_key := range conf_keys {
+		conf_value, ok := secret.Data[conf_key]
+		if ok {
+			logger.Infof("Succeeded to find one of the expected key, %v, for the secret data", conf_key)
+			sEnc = string(conf_value)
+			break
+		}
+		logger.Debugf("the conf key, %s, cannot be found. Keep trying.", conf_key)
+	}
+
+	if sEnc == "" {
+		logger.Errorf("Failed to find any expected key, %v, for the secret data", conf_keys)
+		return err
+	}
+
 	lines := strings.Split(sEnc, "\n")
 
+	var vcRgx = regexp.MustCompile(`\[(.*?) (.*?)\]`)
 	for _, line := range lines {
 		if strings.Contains(line, "VirtualCenter") {
-			parts := strings.Split(line, "\"")
-			params["VirtualCenter"] = parts[1]
+			rs := vcRgx.FindStringSubmatch(line)
+			vcIpWithQuotes := rs[len(rs) - 1]
+			unquotedVcIp, err := strconv.Unquote(string(vcIpWithQuotes))
+			if err != nil {
+				logger.Warnf("Failed to unquote the VirtualCenter hostname from the VC credential")
+				continue
+			}
+			params["VirtualCenter"] = unquotedVcIp
 		} else if strings.Contains(line, "=") {
-			parts := strings.Split(line, "=")
+			parts := strings.SplitN(line, "=", 2)
 			key := strings.TrimSpace(parts[0])
 			value := strings.TrimSpace(parts[1])
-			params[key] = value[1 : len(value)-1]
+			unquotedValue, err := strconv.Unquote(string(value))
+			if err != nil {
+				continue
+			}
+			params[key] = unquotedValue
 		}
 	}
+
+	logger.Debugf("Params: %v", params)
 
 	return nil
 }
@@ -451,4 +500,53 @@ func CreateCnsVolumeInCluster(ctx context.Context, client *govmomi.Client, cnsCl
 	}
 
 	return NewIDFromString(volumeId), nil
+}
+
+func getVcConfigFromParams(params map[string]interface{}) (*url.URL, bool, error) {
+	var vcUrl url.URL
+	vcUrl.Scheme = "https"
+	vcHostStr, ok := params["VirtualCenter"].(string)
+	if !ok {
+		return nil, false, errors.New("Missing vcHost param")
+	}
+	vcHostPortStr, ok := params["port"].(string)
+	if !ok {
+		vcHostPortStr = DefaultVcHostPort
+	}
+	vcUrl.Host = fmt.Sprintf("%s:%s", vcHostStr, vcHostPortStr)
+
+	vcUser, ok := params["user"].(string)
+	if !ok {
+		return nil, false, errors.New("Missing vcUser param")
+	}
+	vcPassword, ok := params["password"].(string)
+	if !ok {
+		return nil, false, errors.New("Missing vcPassword param")
+	}
+	vcUrl.User = url.UserPassword(vcUser, vcPassword)
+	vcUrl.Path = "/sdk"
+
+	insecure := false
+	insecureStr, ok := params["insecure-flag"].(string)
+	if ok && (insecureStr == "TRUE" || insecureStr == "true") {
+		insecure = true
+	}
+
+	return &vcUrl, insecure, nil
+}
+
+func GetVcUrlFromConfig(config *rest.Config, logger logrus.FieldLogger) (*url.URL, bool, error) {
+	params := make(map[string]interface{})
+
+	err := retrievePlatformInfoFromConfig(config, params, logger)
+	if err != nil {
+		return nil, false, errors.Errorf("Failed to retrieve VC config secret: %+v", err)
+	}
+
+	vcUrl, insecure, err := getVcConfigFromParams(params)
+	if err != nil {
+		return nil, false, errors.Errorf("Failed to get VC config from params: %+v", err)
+	}
+
+	return vcUrl, insecure, nil
 }

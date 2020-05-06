@@ -329,9 +329,12 @@ func (this *IVDProtectedEntityTypeManager) copyInt(ctx context.Context, sourcePE
 
 		this.logger.Debugf("Ready to provision a new volume with the source metadata: %v", md)
 		volumeVimID, err := CreateCnsVolumeInCluster(ctx, this.client, this.cnsClient, md, this.logger)
+		if err != nil {
+			return nil, errors.Wrap(err, "Create volume failed")
+		}
 		retPE, err = newIVDProtectedEntity(this, newProtectedEntityID(volumeVimID))
 		if err != nil {
-			return nil, errors.Wrap(err, "CreateDisk failed")
+			return nil, errors.Wrap(err, "Failed to create protected entity from volume ID")
 		}
 		err = retPE.copy(ctx, dataReader, md)
 		if err != nil {
