@@ -132,8 +132,8 @@ func NewIVDProtectedEntityTypeManagerFromURL(url *url.URL, s3URLBase string, ins
 	return retVal, err
 }
 
-const vsphereMajor = 6
-const vSphereMinor = 7
+const vsphereMajor = 7
+const vSphereMinor = 0
 const disklibLib64 = "/usr/lib/vmware-vix-disklib/lib64"
 
 func newIVDProtectedEntityTypeManagerWithClient(client *govmomi.Client, s3URLBase string, vslmClient *vslm.Client,
