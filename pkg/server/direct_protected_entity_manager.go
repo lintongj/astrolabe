@@ -25,6 +25,7 @@ import (
 	"github.com/vmware-tanzu/astrolabe/pkg/fs"
 	"github.com/vmware-tanzu/astrolabe/pkg/ivd"
 	"github.com/vmware-tanzu/astrolabe/pkg/kubernetes"
+	"github.com/vmware-tanzu/astrolabe/pkg/pvc"
 	"io/ioutil"
 	"log"
 	"os"
@@ -43,6 +44,10 @@ func NewDirectProtectedEntityManager(petms []astrolabe.ProtectedEntityTypeManage
 	}
 	for _, curPETM := range petms {
 		returnPEM.typeManager[curPETM.GetTypeName()] = curPETM
+		switch curPETM.(type) {
+		case *pvc.PVCProtectedEntityTypeManager:
+			curPETM.(*pvc.PVCProtectedEntityTypeManager).SetProtectedEntityManager(returnPEM)
+		}
 	}
 	returnPEM.s3Config = s3Config
 	return
@@ -70,6 +75,8 @@ func NewDirectProtectedEntityManagerFromParamMap(configInfo ConfigInfo) *DirectP
 				logger)
 		case "fs":
 			curService, err = fs.NewFSProtectedEntityTypeManagerFromConfig(params, configInfo.s3Config, logger)
+		case "pvc":
+			curService, err = pvc.NewPVCProtectedEntityTypeManagerFromConfig(params, configInfo.s3Config, logger)
 		default:
 
 		}
@@ -87,6 +94,13 @@ func NewDirectProtectedEntityManagerFromParamMap(configInfo ConfigInfo) *DirectP
 type ConfigInfo struct {
 	peConfigs map[string]map[string]interface{}
 	s3Config  astrolabe.S3Config
+}
+
+func NewConfigInfo(peConfigs map[string]map[string]interface{}, s3Config astrolabe.S3Config) ConfigInfo {
+	return ConfigInfo{
+		peConfigs: peConfigs,
+		s3Config:  s3Config,
+	}
 }
 
 func readConfigFiles(confDirPath string) (ConfigInfo, error) {
@@ -133,10 +147,7 @@ func readConfigFiles(confDirPath string) (ConfigInfo, error) {
 		log.Panicf("Could not read S3 configuration directory %s, err = %v\n", s3ConfFilePath, err)
 	}
 
-	return ConfigInfo{
-		peConfigs: configMap,
-		s3Config:  *s3Config,
-	}, nil
+	return NewConfigInfo(configMap, *s3Config), nil
 }
 
 func readConfigFile(confFile string) (map[string]interface{}, error) {
