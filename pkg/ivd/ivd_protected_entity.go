@@ -233,7 +233,7 @@ func newProtectedEntityID(id vim.ID) astrolabe.ProtectedEntityID {
 	return astrolabe.NewProtectedEntityID("ivd", id.Id)
 }
 
-func ewProtectedEntityIDWithSnapshotID(id vim.ID, snapshotID astrolabe.ProtectedEntitySnapshotID) astrolabe.ProtectedEntityID {
+func newProtectedEntityIDWithSnapshotID(id vim.ID, snapshotID astrolabe.ProtectedEntitySnapshotID) astrolabe.ProtectedEntityID {
 	return astrolabe.NewProtectedEntityIDWithSnapshotID("ivd", id.Id, snapshotID)
 }
 

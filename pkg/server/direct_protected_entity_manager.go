@@ -58,13 +58,15 @@ func NewDirectProtectedEntityManagerFromConfigDir(confDirPath string) *DirectPro
 	if err != nil {
 		log.Fatalf("Could not read config files from dir %s, err: %v", confDirPath, err)
 	}
-	return NewDirectProtectedEntityManagerFromParamMap(configInfo)
+	return NewDirectProtectedEntityManagerFromParamMap(configInfo, nil)
 }
 
-func NewDirectProtectedEntityManagerFromParamMap(configInfo ConfigInfo) *DirectProtectedEntityManager {
+func NewDirectProtectedEntityManagerFromParamMap(configInfo ConfigInfo, logger logrus.FieldLogger) *DirectProtectedEntityManager {
 	petms := make([]astrolabe.ProtectedEntityTypeManager, 0) // No guarantee all configs will be valid, so don't preallocate
 	var err error
-	logger := logrus.New()
+	if logger == nil {
+		logger = logrus.New()
+	}
 	for serviceName, params := range configInfo.peConfigs {
 		var curService astrolabe.ProtectedEntityTypeManager
 		switch serviceName {
@@ -78,10 +80,10 @@ func NewDirectProtectedEntityManagerFromParamMap(configInfo ConfigInfo) *DirectP
 		case "pvc":
 			curService, err = pvc.NewPVCProtectedEntityTypeManagerFromConfig(params, configInfo.s3Config, logger)
 		default:
-
+			logger.Warnf("Unknown service type, %v", serviceName)
 		}
 		if err != nil {
-			log.Printf("Could not start service %s err=%v", serviceName, err)
+			logger.Infof("Could not start service %s err=%v", serviceName, err)
 			continue
 		}
 		if curService != nil {

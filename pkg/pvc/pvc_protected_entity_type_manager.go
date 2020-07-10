@@ -2,7 +2,6 @@ package pvc
 
 import (
 	"context"
-	"encoding/base64"
 	"fmt"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -14,16 +13,20 @@ import (
 	"strings"
 )
 
+const (
+	pvcPEType = "pvc"
+	pvcPEIDSep = "/"
+)
+
 type PVCProtectedEntityTypeManager struct {
 	clientSet *kubernetes.Clientset
 	pem       astrolabe.ProtectedEntityManager
 	s3Config  astrolabe.S3Config
+	logger    logrus.FieldLogger
 }
 
-const pvcPEType = "pvc"
-
 func NewProtectedEntityIDFromPVCName(namespace string, pvcName string) astrolabe.ProtectedEntityID {
-	idStr := base64.RawURLEncoding.EncodeToString([]byte(namespace)) + ":" + base64.RawURLEncoding.EncodeToString([]byte(pvcName))
+	idStr := namespace + pvcPEIDSep + pvcName
 	return astrolabe.NewProtectedEntityID(pvcPEType, idStr)
 }
 
@@ -31,22 +34,11 @@ func GetNamespaceAndNameFromPEID(peid astrolabe.ProtectedEntityID) (namespace st
 	if peid.GetPeType() != pvcPEType {
 		return "", "", errors.New(fmt.Sprintf("%s + is not of type %s", peid.GetPeType(), pvcPEType))
 	}
-	parts := strings.Split(peid.GetID(), ":")
+	parts := strings.Split(peid.GetID(), pvcPEIDSep)
 	if len(parts) != 2 {
 		return "", "", errors.New(fmt.Sprintf("%s has %d parts, expected 2", peid.GetID(), len(parts)))
 	}
-	namespaceBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
-	if err != nil {
-		return "", "", errors.New(fmt.Sprintf("Could not decode namespace base64 %s", parts[0]))
-	}
-	namespace = string(namespaceBytes)
-
-	nameBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
-		return "", "", errors.New(fmt.Sprintf("Could not decode name base64 %s", parts[1]))
-	}
-	name = string(nameBytes)
-	return
+	return parts[0], parts[1], nil
 }
 
 func NewPVCProtectedEntityTypeManagerFromConfig(params map[string]interface{}, s3Config astrolabe.S3Config,
@@ -64,6 +56,7 @@ func NewPVCProtectedEntityTypeManagerFromConfig(params map[string]interface{}, s
 	return &PVCProtectedEntityTypeManager{
 		clientSet: clientSet,
 		s3Config: s3Config,
+		logger: logger,
 	}, nil
 }
 
@@ -87,7 +80,7 @@ func (this *PVCProtectedEntityTypeManager) GetProtectedEntity(ctx context.Contex
 		return nil, errors.Wrapf(err, "Could not create PVCProtectedEntity for namespace = %s, name = %s", namespace, name)
 	}
 
-	_, err = returnPE.getPVC()
+	_, err = returnPE.GetPVC()
 	if err != nil {
 		return nil, errors.Wrapf(err, "Could not retrieve PVC for namespace = %s, name = %s", namespace, name)
 	}
@@ -95,13 +88,20 @@ func (this *PVCProtectedEntityTypeManager) GetProtectedEntity(ctx context.Contex
 }
 
 func (this *PVCProtectedEntityTypeManager) GetProtectedEntities(ctx context.Context) ([]astrolabe.ProtectedEntityID, error) {
-	pvcList, err := this.clientSet.CoreV1().PersistentVolumeClaims("").List(metav1.ListOptions{})
+	nsList, err := this.clientSet.CoreV1().Namespaces().List(metav1.ListOptions{})
 	if err != nil {
-		return nil, errors.Wrap(err, "Could not list PVCs")
+		return nil, errors.Wrap(err, "Could not list namespaces")
 	}
 	retPEIDs := make([]astrolabe.ProtectedEntityID, 0)
-	for _, curPVC := range pvcList.Items {
-		retPEIDs = append(retPEIDs, NewProtectedEntityIDFromPVCName(curPVC.Namespace, curPVC.Name))
+	for _, ns := range nsList.Items {
+		pvcList, err := this.clientSet.CoreV1().PersistentVolumeClaims(ns.Name).List(metav1.ListOptions{})
+		if err != nil {
+			return nil, errors.Wrap(err, "Could not list PVCs")
+		}
+
+		for _, curPVC := range pvcList.Items {
+			retPEIDs = append(retPEIDs, NewProtectedEntityIDFromPVCName(curPVC.Namespace, curPVC.Name))
+		}
 	}
 	return retPEIDs, nil
 }
