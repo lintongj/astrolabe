@@ -137,7 +137,7 @@ func (this IVDProtectedEntity) getDiskConnectionParams(ctx context.Context, read
 	} else {
 		flags = gDiskLib.VIXDISKLIB_FLAG_OPEN_UNBUFFERED
 	}
-	transportMode := "nbd"
+	transportMode := "nbdssl"
 	thumbPrint, err := gDiskLib.GetThumbPrintForURL(*url)
 	if err != nil {
 		this.logger.Errorf("Failed to get the thumb print for the URL, %s", url.String())

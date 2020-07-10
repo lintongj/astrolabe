@@ -587,6 +587,16 @@ func TestBackupEncryptedIVD(t *testing.T) {
 	}
 	logger.Debugf("VM, %v(%v), powered on", vmRef, vmName)
 	defer func() {
+		vmPowerState, err := vmMo.PowerState(ctx)
+		if err != nil {
+			logger.Errorf("Failed to get the power state for the VM, %v: %v", vmName, err)
+			return
+		}
+		if vmPowerState != types.VirtualMachinePowerStatePoweredOn {
+			logger.Debugf("the VM, %v, is NOT powered on. Skiping the comming PowerOff operation", vmName)
+			return
+		}
+
 		vimTask, err := vmMo.PowerOff(ctx)
 		if err != nil {
 			t.Skipf("Failed to create a VM PowerOff task: %v", err)
