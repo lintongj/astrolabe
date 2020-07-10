@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	pvcPEType = "pvc"
+	pvcPEType  = "pvc"
 	pvcPEIDSep = "/"
 )
 
@@ -55,8 +55,8 @@ func NewPVCProtectedEntityTypeManagerFromConfig(params map[string]interface{}, s
 	}
 	return &PVCProtectedEntityTypeManager{
 		clientSet: clientSet,
-		s3Config: s3Config,
-		logger: logger,
+		s3Config:  s3Config,
+		logger:    logger,
 	}, nil
 }
 

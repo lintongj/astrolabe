@@ -70,4 +70,3 @@ func main() {
 		log.Fatalln(err)
 	}
 }
-

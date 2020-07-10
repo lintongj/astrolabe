@@ -50,7 +50,7 @@ func NewProtectedEntityIDFromString(peiString string) (returnPEI ProtectedEntity
 	return returnPEI, returnError
 }
 
-func NewProtectedEntityIDFromModel(mpei models.ProtectedEntityID) (ProtectedEntityID, error){
+func NewProtectedEntityIDFromModel(mpei models.ProtectedEntityID) (ProtectedEntityID, error) {
 	return NewProtectedEntityIDFromString(string(mpei))
 }
 
@@ -109,8 +109,7 @@ func (this *ProtectedEntityID) UnmarshalJSON(b []byte) error {
 	return fillInProtectedEntityIDFromString(this, idStr)
 }
 
-type
-ProtectedEntitySnapshotID struct {
+type ProtectedEntitySnapshotID struct {
 	// We should move this to actually being a UUID internally
 	id string
 }

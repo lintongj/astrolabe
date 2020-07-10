@@ -6,12 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/pkg/errors"
-	k8serrors "k8s.io/apimachinery/pkg/api/errors"
-"github.com/sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 	"github.com/vmware-tanzu/astrolabe/pkg/astrolabe"
 	"io"
 	"io/ioutil"
 	core_v1 "k8s.io/api/core/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"strings"
 )
@@ -24,20 +24,20 @@ are available
 The PVC at the time of the snapshot is serialized and stored in a config map in the namespace named
 pvc-snap.<pvc name>.  Each snapshot has an entry in the binary data map for the serialized PVC data, named by the
 snapshot ID (this is the snapshot ID returned by the subcomponent)
- */
+*/
 
 const (
 	VSphereCSIProvisioner = "csi.vsphere.vmware.com"
-    PEInfoPrefix = "peinfo"
+	PEInfoPrefix          = "peinfo"
 )
 
 type PVCProtectedEntity struct {
-	ppetm     *PVCProtectedEntityTypeManager
-	id        astrolabe.ProtectedEntityID
-	data      []astrolabe.DataTransport
-	metadata  []astrolabe.DataTransport
-	combined  []astrolabe.DataTransport
-	logger    logrus.FieldLogger
+	ppetm    *PVCProtectedEntityTypeManager
+	id       astrolabe.ProtectedEntityID
+	data     []astrolabe.DataTransport
+	metadata []astrolabe.DataTransport
+	combined []astrolabe.DataTransport
+	logger   logrus.FieldLogger
 }
 
 func newPVCProtectedEntity(ppetm *PVCProtectedEntityTypeManager, peid astrolabe.ProtectedEntityID) (PVCProtectedEntity, error) {
@@ -50,12 +50,12 @@ func newPVCProtectedEntity(ppetm *PVCProtectedEntityTypeManager, peid astrolabe.
 	}
 
 	returnPE := PVCProtectedEntity{
-		ppetm: ppetm,
-		id: peid,
-		data: data,
+		ppetm:    ppetm,
+		id:       peid,
+		data:     data,
 		metadata: metadata,
 		combined: combined,
-		logger: ppetm.logger,
+		logger:   ppetm.logger,
 	}
 	return returnPE, nil
 }
@@ -111,17 +111,17 @@ func (this PVCProtectedEntity) Snapshot(ctx context.Context) (astrolabe.Protecte
 
 		snapConfigMap = &core_v1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:                       snapConfigMapName,
-				Namespace:                  pvc.Namespace,
+				Name:      snapConfigMapName,
+				Namespace: pvc.Namespace,
 			},
 		}
 		create = true
 	} else {
-			binaryData = snapConfigMap.BinaryData
+		binaryData = snapConfigMap.BinaryData
 	}
 	pvcData, err := pvc.Marshal()
 	if err != nil {
-		return astrolabe.ProtectedEntitySnapshotID{}, errors.Wrapf(err, "Could not marshal PVC data for ",
+		return astrolabe.ProtectedEntitySnapshotID{}, errors.Wrapf(err, "Could not marshal PVC data for %v",
 			this.id.String())
 	}
 
@@ -131,14 +131,14 @@ func (this PVCProtectedEntity) Snapshot(ctx context.Context) (astrolabe.Protecte
 	binaryData[subSnapshotID.String()] = pvcData
 	peInfo, err := this.GetInfo(ctx)
 	if err != nil {
-		return astrolabe.ProtectedEntitySnapshotID{}, errors.Wrapf(err, "Could not retrieve PE info for ",
+		return astrolabe.ProtectedEntitySnapshotID{}, errors.Wrapf(err, "Could not retrieve PE info for %v",
 			this.id.String())
 	}
 	peInfoData, err := json.Marshal(peInfo)
 	if err != nil {
 		return astrolabe.ProtectedEntitySnapshotID{}, errors.Wrapf(err, "Marshal peid info %s failed", components[0].GetID())
 	}
-	binaryData[PEInfoPrefix + "-" + subSnapshotID.String()] = peInfoData
+	binaryData[PEInfoPrefix+"-"+subSnapshotID.String()] = peInfoData
 	snapConfigMap.BinaryData = binaryData
 	if create {
 		_, err = this.ppetm.clientSet.CoreV1().ConfigMaps(pvc.Namespace).Create(snapConfigMap)
@@ -188,7 +188,7 @@ func (this PVCProtectedEntity) DeleteSnapshot(ctx context.Context, snapshotToDel
 	if err != nil {
 		return false, errors.Wrap(err, fmt.Sprintf("Could not retrieve pvc peid=%s", this.id.String()))
 	}
-	
+
 	snapConfigMapName := GetSnapConfigMapName(pvc)
 	snapConfigMap, err := this.ppetm.clientSet.CoreV1().ConfigMaps(pvc.Namespace).Get(snapConfigMapName, metav1.GetOptions{})
 	if err != nil {
@@ -203,7 +203,7 @@ func (this PVCProtectedEntity) DeleteSnapshot(ctx context.Context, snapshotToDel
 	_, snapPVCInfoExists := snapConfigMap.BinaryData[snapshotToDelete.String()]
 	if snapPVCInfoExists {
 		delete(snapConfigMap.BinaryData, snapshotToDelete.String())
-		delete(snapConfigMap.BinaryData, "peinfo-" + snapshotToDelete.String())
+		delete(snapConfigMap.BinaryData, "peinfo-"+snapshotToDelete.String())
 		updatedSnapConfigMap, err := this.ppetm.clientSet.CoreV1().ConfigMaps(pvc.Namespace).Update(snapConfigMap)
 		if err != nil {
 			return false, errors.Wrapf(err, "Could not update snapshot configmap %s for %s", snapConfigMapName,
@@ -308,7 +308,7 @@ func (this PVCProtectedEntity) GetMetadataReader(ctx context.Context) (io.ReadCl
 	}
 	pvc, err := this.GetPVC()
 	if err != nil {
-		return nil, errors.Wrapf(err,"Could not get pvc")
+		return nil, errors.Wrapf(err, "Could not get pvc")
 	}
 	pvcBytes, err := pvc.Marshal()
 	return ioutil.NopCloser(bytes.NewReader(pvcBytes)), nil

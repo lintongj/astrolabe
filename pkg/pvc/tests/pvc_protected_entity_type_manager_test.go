@@ -39,7 +39,7 @@ func TestGetPVCComponents(t *testing.T) {
 	}
 
 	// get pvc params
-	pvcParams :=make(map[string]interface{})
+	pvcParams := make(map[string]interface{})
 	pvcParams["kubeconfigPath"] = path
 
 	configParams := make(map[string]map[string]interface{})
@@ -47,7 +47,7 @@ func TestGetPVCComponents(t *testing.T) {
 	configParams["ivd"] = ivdParams
 
 	configInfo := server.NewConfigInfo(configParams, astrolabe.S3Config{
-		URLBase:   "VOID_URL",
+		URLBase: "VOID_URL",
 	})
 
 	pem := server.NewDirectProtectedEntityManagerFromParamMap(configInfo, logger)
@@ -106,7 +106,7 @@ func TestSnapshotOps(t *testing.T) {
 	}
 
 	// get pvc params
-	pvcParams :=make(map[string]interface{})
+	pvcParams := make(map[string]interface{})
 	pvcParams["kubeconfigPath"] = path
 
 	configParams := make(map[string]map[string]interface{})
@@ -114,7 +114,7 @@ func TestSnapshotOps(t *testing.T) {
 	configParams["ivd"] = ivdParams
 
 	configInfo := server.NewConfigInfo(configParams, astrolabe.S3Config{
-		URLBase:   "VOID_URL",
+		URLBase: "VOID_URL",
 	})
 
 	pem := server.NewDirectProtectedEntityManagerFromParamMap(configInfo, logger)
@@ -176,6 +176,5 @@ func TestSnapshotOps(t *testing.T) {
 	curSnapshotsNum := len(peSnapshotIDs)
 	logger.Infof("There are %v snapshots for the PVC PE, %v, after snapshotting it", curSnapshotsNum, pvcPE.GetID().String())
 
-	assert.Equal(t, curSnapshotsNum - prevSnapshotsNum, 1, "there should be one more snapshot available")
+	assert.Equal(t, curSnapshotsNum-prevSnapshotsNum, 1, "there should be one more snapshot available")
 }
-
