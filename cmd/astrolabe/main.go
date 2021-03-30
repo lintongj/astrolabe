@@ -3,17 +3,21 @@ package main
 import (
 	"context"
 	"fmt"
+
 	"github.com/pkg/errors"
 	"github.com/urfave/cli/v2"
+
 	// restClient is the underlying REST/Swagger client
 	restClient "github.com/vmware-tanzu/astrolabe/gen/client"
 	"github.com/vmware-tanzu/astrolabe/pkg/astrolabe"
+
 	// astrolabeClient is the Astrolabe API on top of the REST client
-	astrolabeClient "github.com/vmware-tanzu/astrolabe/pkg/client"
-	"github.com/vmware-tanzu/astrolabe/pkg/server"
 	"io"
 	"log"
 	"os"
+
+	astrolabeClient "github.com/vmware-tanzu/astrolabe/pkg/client"
+	"github.com/vmware-tanzu/astrolabe/pkg/server"
 )
 
 func main() {
@@ -72,7 +76,7 @@ func main() {
 			},
 			{
 				Name:      "cp",
-				Usage:     "copies a Protected Entity snapshot",
+				Usage:     "copies a Protected Entity snapshot to a zip file or copies a zip file to a Protected Entity",
 				Action:    cp,
 				ArgsUsage: "<src> <dest>",
 			},
@@ -111,6 +115,7 @@ func setupProtectedEntityManager(c *cli.Context) (pem astrolabe.ProtectedEntityM
 	err = errors.New("No configuration parameters supplied")
 	return
 }
+
 func types(c *cli.Context) error {
 	pem, err := setupProtectedEntityManager(c)
 	if err != nil {
@@ -256,7 +261,9 @@ func cp(c *cli.Context) error {
 	}
 	srcStr := c.Args().First()
 	destStr := c.Args().Get(1)
+	ctx := context.Background()
 	var err error
+	var srcPE, destPE astrolabe.ProtectedEntity
 	var srcPEID, destPEID astrolabe.ProtectedEntityID
 	var srcFile, destFile string
 	srcPEID, err = astrolabe.NewProtectedEntityIDFromString(srcStr)
@@ -269,7 +276,7 @@ func cp(c *cli.Context) error {
 	}
 	pem, err := setupProtectedEntityManager(c)
 	if err != nil {
-		log.Fatalf("Could not setup protected entity manager, err =%v", err)
+		log.Fatalf("Could not setup protected entity manager, err = %v", err)
 	}
 
 	var reader io.ReadCloser
@@ -279,38 +286,68 @@ func cp(c *cli.Context) error {
 		fmt.Printf("file %s", srcFile)
 	} else {
 		fmt.Printf("pe %s", srcPEID.String())
-		srcPE, err := pem.GetProtectedEntity(context.Background(), srcPEID)
+		srcPE, err = pem.GetProtectedEntity(ctx, srcPEID)
 		if err != nil {
 			log.Fatalf("Could not retrieve protected entity ID %s, err: %v", srcPEID.String(), err)
 		}
-		var dw io.WriteCloser
-		reader, dw = io.Pipe()
-		go zipPE(context.Background(), srcPE, dw)
 	}
 	fmt.Printf(" to ")
 	if destFile != "" {
 		fmt.Printf("file %s", destFile)
-		writer, err = os.Create(destFile)
-		if err != nil {
-			log.Fatalf("Could not create file %s, err: %v", destFile, err)
-		}
 	} else {
 		fmt.Printf("pe %s", destPEID.String())
+		destPE, err = pem.GetProtectedEntity(ctx, destPEID)
+		if err != nil {
+			log.Fatalf("Could not retrieve protected entity ID %s, err: %v", destPEID.String(), err)
+		}
 	}
 	fmt.Printf("\n")
 
-	bytesCopied, err := io.Copy(writer, reader)
+	var bytesCopied int64
+	if srcPE != nil && destFile != "" {
+		// copy a src pe snapshot to a dest file
+		var zipFileWriter io.WriteCloser
+		zipFileWriter, err = os.Create(destFile)
+		if err != nil {
+			log.Fatalf("Could not create file %s, err: %v", destFile, err)
+		}
+		defer func() {
+			if err := zipFileWriter.Close(); err != nil {
+				log.Fatalf("Could not close file %s, err: %v", destFile, err)
+			}
+		}()
+
+		bytesCopied, err = astrolabe.ZipProtectedEntityToFile(ctx, srcPE, zipFileWriter)
+	} else if srcFile != "" && destPE != nil {
+		// copy a src file to an existing dest pe. BTW, the dest pe should be unconsumed.
+		file, err := os.Open(srcFile)
+		if err != nil {
+			log.Fatalf("Could not open srcFile %s, err = %v", srcFile, err)
+		}
+		defer file.Close()
+
+		fileInfo, err := file.Stat()
+		if err != nil {
+			log.Fatalf("Got err %v getting stat for source file %v", err, srcFile)
+		}
+
+		err = astrolabe.UnzipFileToProtectedEntity(ctx, file, fileInfo.Size(), destPE)
+		bytesCopied = fileInfo.Size()
+	} else {
+		reader, err = os.Open(srcFile)
+		if err != nil {
+			log.Fatalf("Could not open srcFile %s, err = %v", srcFile, err)
+		}
+		defer reader.Close()
+
+		bytesCopied, err = io.Copy(writer, reader)
+	}
+
 	if err != nil {
 		log.Fatalf("Error copying %v", err)
 	}
-	fmt.Printf("Copied %d bytes\n", bytesCopied)
-	return nil
-}
 
-func zipPE(ctx context.Context, pe astrolabe.ProtectedEntity, writer io.WriteCloser) {
-	defer writer.Close()
-	err := astrolabe.ZipProtectedEntityToWriter(ctx, pe, writer)
-	if err != nil {
-		log.Fatalf("Failed to zip protected entity %s, err = %v", pe.GetID().String(), err)
-	}
+	fmt.Printf("Copied %d bytes\n", bytesCopied)
+
+	return nil
 }
