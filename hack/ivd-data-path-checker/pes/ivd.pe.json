@@ -1,0 +1,7 @@
+{
+  "VirtualCenter": "10.185.13.199",
+  "user": "Administrator@vsphere.local",
+  "password": "Admin!23",
+  "port": "443",
+  "insecure-flag": "true"
+}

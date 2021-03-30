@@ -34,8 +34,6 @@ import (
 	"github.com/vmware/govmomi/vim25/mo"
 	"github.com/vmware/govmomi/vim25/soap"
 	"github.com/vmware/govmomi/vim25/types"
-	"math"
-	"math/rand"
 	"os"
 	"reflect"
 	"strconv"
@@ -113,7 +111,7 @@ func TestSnapshotOpsUnderRaceCondition(t *testing.T) {
 	ivdDs := datastores[0]
 	var ivdIds []types.ID
 	for i := 0; i < nIVDs; i++ {
-		createSpec := getCreateSpec(getRandomName("ivd", 5), 10, ivdDs, nil)
+		createSpec := GetCreateSpec(GetRandomName("ivd", 5), 10, ivdDs, nil)
 		vslmTask, err := ivdPETM.vslmManager.CreateDisk(ctx, createSpec)
 		if err != nil {
 			t.Skipf("Failed to create task for CreateDisk invocation")
@@ -163,7 +161,7 @@ func TestSnapshotOpsUnderRaceCondition(t *testing.T) {
 	}
 
 	logger.Debugf("Creating VM on host: %v, and datastore: %v", vmHost.Reference(), ivdDsMo.Name)
-	vmName := getRandomName("vm", 5)
+	vmName := GetRandomName("vm", 5)
 	vmMo, err := vmCreate(ctx, virtualCenter.Client.Client, vmHost.Reference(), vmName, ivdDsMo.Name, nil, logger)
 	if err != nil {
 		t.Skipf("Failed to create a VM with err: %v", err)
@@ -402,28 +400,6 @@ func findAllAccessibleDatastoreByType(ctx context.Context, client *vim25.Client,
 	return dsList, nil
 }
 
-func getCreateSpec(name string, capacity int64, datastore types.ManagedObjectReference, profile []types.BaseVirtualMachineProfileSpec) types.VslmCreateSpec {
-	keepAfterDeleteVm := true
-	return types.VslmCreateSpec{
-		Name:              name,
-		KeepAfterDeleteVm: &keepAfterDeleteVm,
-		BackingSpec: &types.VslmCreateSpecDiskFileBackingSpec{
-			VslmCreateSpecBackingSpec: types.VslmCreateSpecBackingSpec{
-				Datastore: datastore,
-			},
-		},
-		CapacityInMB: capacity,
-		Profile:      profile,
-	}
-}
-
-func getRandomName(prefix string, nDigits int) string {
-	rand.Seed(time.Now().UnixNano())
-	num := rand.Int63n(int64(math.Pow10(nDigits)))
-	numstr := strconv.FormatInt(num, 10)
-	return fmt.Sprintf("%s-%s", prefix, numstr)
-}
-
 func vmAttachDisk(ctx context.Context, client *vim25.Client, vm types.ManagedObjectReference, diskId types.ID, datastore types.ManagedObjectReference) (*object.Task, error) {
 	req := types.AttachDisk_Task{
 		This:       vm.Reference(),
@@ -596,7 +572,7 @@ func TestBackupEncryptedIVD(t *testing.T) {
 	}
 
 	logger.Debugf("Creating VM on host: %v, and datastore: %v", vmHost.Reference(), vmDsMo.Name)
-	vmName := getRandomName("vm", 5)
+	vmName := GetRandomName("vm", 5)
 	vmProfile := getProfileSpecs(encryptionProfileId)
 	vmMo, err := vmCreate(ctx, virtualCenter.Client.Client, vmHost.Reference(), vmName, vmDsMo.Name, vmProfile, logger)
 	if err != nil {
@@ -646,7 +622,7 @@ func TestBackupEncryptedIVD(t *testing.T) {
 
 	var ivdIds []types.ID
 	for i := 0; i < nIVDs; i++ {
-		createSpec := getCreateSpec(getRandomName("ivd", 5), 50, ivdDs, ivdProfile)
+		createSpec := GetCreateSpec(GetRandomName("ivd", 5), 50, ivdDs, ivdProfile)
 		vslmTask, err := ivdPETM.vslmManager.CreateDisk(ctx, createSpec)
 		if err != nil {
 			t.Skipf("Failed to create task for CreateDisk invocation")

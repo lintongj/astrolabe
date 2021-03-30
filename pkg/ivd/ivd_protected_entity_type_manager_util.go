@@ -18,7 +18,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"math"
+	"math/rand"
+	"strconv"
 	"strings"
+	"time"
 )
 
 func findDatacenterPath(ctx context.Context, client *vim25.Client, objectRef vim25types.ManagedObjectReference, logger logrus.FieldLogger) (string, error) {
@@ -407,3 +411,55 @@ func CreateCnsVolumeInCluster(ctx context.Context, vcConfig *vsphere.VirtualCent
 
 	return NewIDFromString(volumeId), nil
 }
+
+func GetCreateSpec(name string, capacity int64, datastore vim25types.ManagedObjectReference, profile []vim25types.BaseVirtualMachineProfileSpec) vim25types.VslmCreateSpec {
+	keepAfterDeleteVm := true
+	return vim25types.VslmCreateSpec{
+		Name:              name,
+		KeepAfterDeleteVm: &keepAfterDeleteVm,
+		BackingSpec: &vim25types.VslmCreateSpecDiskFileBackingSpec{
+			VslmCreateSpecBackingSpec: vim25types.VslmCreateSpecBackingSpec{
+				Datastore: datastore,
+			},
+		},
+		CapacityInMB: capacity,
+		Profile:      profile,
+	}
+}
+
+func GetRandomName(prefix string, nDigits int) string {
+	rand.Seed(time.Now().UnixNano())
+	num := rand.Int63n(int64(math.Pow10(nDigits)))
+	numstr := strconv.FormatInt(num, 10)
+	return fmt.Sprintf("%s-%s", prefix, numstr)
+}
+
+func CreateIVDUtil(ctx context.Context, ivdPETM *IVDProtectedEntityTypeManager, spec vim25types.VslmCreateSpec) (vim25types.ID, error){
+	vslmTask, err := ivdPETM.vslmManager.CreateDisk(ctx, spec)
+	if err != nil {
+		return vim25types.ID{}, errors.New("Failed to create task for CreateDisk invocation")
+	}
+
+	taskResult, err := vslmTask.Wait(ctx, waitTime)
+	if err != nil {
+		return vim25types.ID{}, errors.New("Failed at waiting for the CreateDisk invocation")
+	}
+	vStorageObject := taskResult.(vim25types.VStorageObject)
+
+	return vStorageObject.Config.Id, nil
+}
+
+func DeleteIVDUtil(ctx context.Context, ivdPETM *IVDProtectedEntityTypeManager, id vim25types.ID) error {
+	vslmTask, err := ivdPETM.vslmManager.Delete(ctx, id)
+	if err != nil {
+		return errors.Errorf("Failed to create task for DeleteDisk invocation with err: %v", err)
+	}
+
+	_, err = vslmTask.Wait(ctx, waitTime)
+	if err != nil {
+		return errors.Errorf("Failed at waiting for the DeleteDisk invocation with err: %v", err)
+	}
+	
+	return nil
+}
+
