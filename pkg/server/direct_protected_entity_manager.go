@@ -56,12 +56,12 @@ func NewDirectProtectedEntityManager(petms []astrolabe.ProtectedEntityTypeManage
 	return
 }
 
-func NewDirectProtectedEntityManagerFromConfigDir(confDirPath string) *DirectProtectedEntityManager {
+func NewDirectProtectedEntityManagerFromConfigDir(confDirPath string, logger logrus.FieldLogger) *DirectProtectedEntityManager {
 	configInfo, err := readConfigFiles(confDirPath)
 	if err != nil {
-		log.Fatalf("Could not read config files from dir %s, err: %v", confDirPath, err)
+		logger.Errorf("Could not read config files from dir %s, err: %v", confDirPath, err)
 	}
-	return NewDirectProtectedEntityManagerFromParamMap(configInfo, nil)
+	return NewDirectProtectedEntityManagerFromParamMap(configInfo, logger)
 }
 
 func NewDirectProtectedEntityManagerFromParamMap(configInfo ConfigInfo, logger logrus.FieldLogger) *DirectProtectedEntityManager {

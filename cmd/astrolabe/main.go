@@ -4,7 +4,10 @@ import (
 	"context"
 	"fmt"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli/v2"
+	"time"
+
 	// restClient is the underlying REST/Swagger client
 	restClient "github.com/vmware-tanzu/astrolabe/gen/client"
 	"github.com/vmware-tanzu/astrolabe/pkg/astrolabe"
@@ -23,6 +26,11 @@ func main() {
 				Name:  "host",
 				Usage: "Astrolabe server",
 			},
+			&cli.StringFlag{
+				Name:     "destHost",
+				Usage:    "Optional different destination Astrolabe server for cp",
+				Required: false,
+			},
 			&cli.BoolFlag{
 				Name:     "insecure",
 				Usage:    "Only use HTTP",
@@ -33,6 +41,11 @@ func main() {
 			&cli.StringFlag{
 				Name:  "confDir",
 				Usage: "Configuration directory",
+			},
+			&cli.StringFlag{
+				Name:     "destConfDir",
+				Usage:    "Optional different destination Astrolabe configuration directory for cp",
+				Required: false,
 			},
 		},
 		Commands: []*cli.Command{
@@ -76,6 +89,12 @@ func main() {
 				Action:    cp,
 				ArgsUsage: "<src> <dest>",
 			},
+			{
+				Name:      "overwrite",
+				Usage:     "overwrites a Protected Entity with source file",
+				Action:    overwrite,
+				ArgsUsage: "<src> <dest>",
+			},
 		},
 	}
 
@@ -86,31 +105,71 @@ func main() {
 }
 
 func setupProtectedEntityManager(c *cli.Context) (pem astrolabe.ProtectedEntityManager, err error) {
-	confDirStr := c.String("confDir")
-	if confDirStr != "" {
-		pem = server.NewProtectedEntityManager(confDirStr)
-		return
-	}
-	host := c.String("host")
-	if host != "" {
-		insecure := c.Bool("insecure")
-		transport := restClient.DefaultTransportConfig()
-		transport.Host = host
-		if insecure {
-			transport.Schemes = []string{"http"}
-		}
-
-		restClient := restClient.NewHTTPClientWithConfig(nil, transport)
-		pem, err = astrolabeClient.NewClientProtectedEntityManager(restClient)
-		if err != nil {
-			err = errors.Wrap(err, "Failed to create new ClientProtectedEntityManager")
-			return
-		}
-		return
-	}
-	err = errors.New("No configuration parameters supplied")
+	pem, _, err = setupProtectedEntityManagers(c, false)
 	return
 }
+
+func setupProtectedEntityManagers(c *cli.Context, allowDual bool) (srcPem astrolabe.ProtectedEntityManager,
+	destPem astrolabe.ProtectedEntityManager, err error) {
+	// setup logger
+	logger := logrus.New()
+	formatter := new(logrus.TextFormatter)
+	formatter.TimestampFormat = time.RFC3339Nano
+	formatter.FullTimestamp = true
+	logger.SetFormatter(formatter)
+
+	confDirStr := c.String("confDir")
+	if confDirStr != "" {
+		srcPem = server.NewProtectedEntityManager(confDirStr, logger)
+	}
+	if srcPem == nil {
+		host := c.String("host")
+		if host != "" {
+			srcPem, err = setupHostPEM(host, c)
+			if err != nil {
+				return
+			}
+		}
+	}
+
+	if allowDual {
+		destConfDirStr := c.String("destConfDir")
+		if destConfDirStr != "" {
+			destPem = server.NewProtectedEntityManager(confDirStr, logger)
+		}
+		if destPem == nil {
+			destHost := c.String("destHost")
+			if destHost != "" {
+				destPem, err = setupHostPEM(destHost, c)
+				if err != nil {
+					return
+				}
+			}
+		}
+	}
+	if destPem == nil {
+		destPem = srcPem
+	}
+	return
+}
+
+func setupHostPEM(host string, c *cli.Context) (hostPem astrolabe.ProtectedEntityManager, err error) {
+	insecure := c.Bool("insecure")
+	transport := restClient.DefaultTransportConfig()
+	transport.Host = host
+	if insecure {
+		transport.Schemes = []string{"http"}
+	}
+
+	restClient := restClient.NewHTTPClientWithConfig(nil, transport)
+	hostPem, err = astrolabeClient.NewClientProtectedEntityManager(restClient)
+	if err != nil {
+		err = errors.Wrap(err, "Failed to create new ClientProtectedEntityManager")
+		return
+	}
+	return
+}
+
 func types(c *cli.Context) error {
 	pem, err := setupProtectedEntityManager(c)
 	if err != nil {
@@ -194,6 +253,11 @@ func show(c *cli.Context) error {
 		log.Fatalf("Could not retrieve info for %s, err: %v", peIDStr, err)
 	}
 	fmt.Printf("%v\n", info)
+	fmt.Println("Components:")
+	components, err := pe.GetComponents(context.Background())
+	for component := range components {
+		fmt.Printf("%v\n", component)
+	}
 	return nil
 }
 
@@ -256,7 +320,9 @@ func cp(c *cli.Context) error {
 	}
 	srcStr := c.Args().First()
 	destStr := c.Args().Get(1)
+	ctx := context.Background()
 	var err error
+	var srcPE astrolabe.ProtectedEntity
 	var srcPEID, destPEID astrolabe.ProtectedEntityID
 	var srcFile, destFile string
 	srcPEID, err = astrolabe.NewProtectedEntityIDFromString(srcStr)
@@ -269,7 +335,7 @@ func cp(c *cli.Context) error {
 	}
 	pem, err := setupProtectedEntityManager(c)
 	if err != nil {
-		log.Fatalf("Could not setup protected entity manager, err =%v", err)
+		log.Fatalf("Could not setup protected entity manager, err = %v", err)
 	}
 
 	var reader io.ReadCloser
@@ -277,29 +343,33 @@ func cp(c *cli.Context) error {
 	fmt.Printf("cp from ")
 	if srcFile != "" {
 		fmt.Printf("file %s", srcFile)
+		reader, err = os.Open(srcFile)
+		if err != nil {
+			log.Fatalf("Could not open srcFile %s, err = %v", srcFile, err)
+		}
+
 	} else {
 		fmt.Printf("pe %s", srcPEID.String())
-		srcPE, err := pem.GetProtectedEntity(context.Background(), srcPEID)
+		srcPE, err = pem.GetProtectedEntity(ctx, srcPEID)
 		if err != nil {
 			log.Fatalf("Could not retrieve protected entity ID %s, err: %v", srcPEID.String(), err)
 		}
-		var dw io.WriteCloser
-		reader, dw = io.Pipe()
-		go zipPE(context.Background(), srcPE, dw)
 	}
 	fmt.Printf(" to ")
 	if destFile != "" {
 		fmt.Printf("file %s", destFile)
-		writer, err = os.Create(destFile)
-		if err != nil {
-			log.Fatalf("Could not create file %s, err: %v", destFile, err)
-		}
 	} else {
 		fmt.Printf("pe %s", destPEID.String())
 	}
 	fmt.Printf("\n")
 
-	bytesCopied, err := io.Copy(writer, reader)
+	var bytesCopied int64
+	if srcPE != nil && destFile != "" {
+		bytesCopied, err = astrolabe.ZipProtectedEntityToFile(ctx, srcPE, destFile)
+	} else {
+		bytesCopied, err = io.Copy(writer, reader)
+	}
+
 	if err != nil {
 		log.Fatalf("Error copying %v", err)
 	}
@@ -307,10 +377,53 @@ func cp(c *cli.Context) error {
 	return nil
 }
 
-func zipPE(ctx context.Context, pe astrolabe.ProtectedEntity, writer io.WriteCloser) {
-	defer writer.Close()
-	err := astrolabe.ZipProtectedEntity(ctx, pe, writer)
-	if err != nil {
-		log.Fatalf("Failed to zip protected entity %s, err = %v", pe.GetID().String(), err)
+func overwrite(c *cli.Context) error {
+	if c.NArg() != 2 {
+		log.Fatalf("Expected two arguments for overwrite, got %d", c.NArg())
 	}
+	srcStr := c.Args().First()
+	destStr := c.Args().Get(1)
+	ctx := context.Background()
+	var err error
+	var destPE astrolabe.ProtectedEntity
+	var destPEID astrolabe.ProtectedEntityID
+	var srcFile, destFile string
+	_, err = astrolabe.NewProtectedEntityIDFromString(srcStr)
+	if err != nil {
+		srcFile = srcStr
+	}
+	destPEID, err = astrolabe.NewProtectedEntityIDFromString(destStr)
+	if err != nil {
+		destFile = destStr
+	}
+	pem, err := setupProtectedEntityManager(c)
+	if err != nil {
+		log.Fatalf("Could not setup protected entity manager, err = %v", err)
+	}
+
+	fmt.Printf("overwrite from ")
+	if srcFile != "" {
+		fmt.Printf("file %s", srcFile)
+	} else {
+		log.Fatalf("Not support a Protected Entity(%v) as the source", srcStr)
+	}
+	fmt.Printf(" to ")
+	if destFile != "" {
+		log.Fatalf("Not support a file(%v) as the destination", destStr)
+	} else {
+		fmt.Printf("pe %s", destPEID.String())
+	}
+	fmt.Printf("\n")
+
+	destPE, err = pem.GetProtectedEntity(ctx, destPEID)
+	if err != nil {
+		log.Fatalf("Got err %v getting the dest PE from dest PE ID %v", err, destPEID)
+	}
+
+	// unzip the source zip file and use its data to overwrite the dest protected entity
+	if err = astrolabe.UnzipFileToProtectedEntity(ctx, srcFile, destPE); err != nil {
+		log.Fatal(err)
+	}
+
+	return nil
 }

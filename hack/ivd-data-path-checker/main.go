@@ -23,7 +23,7 @@ func main() {
 	}
 
 	// step 1: set up astrolabe PEM from config directory with IVD config info
-	pem := server.NewProtectedEntityManager(configFilePath)
+	pem := server.NewProtectedEntityManager(configFilePath, logrus.New())
 	if pem == nil {
 		logger.Error("Unexpected config file provided")
 		return
