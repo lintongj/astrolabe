@@ -18,11 +18,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
-	"math"
-	"math/rand"
-	"strconv"
 	"strings"
-	"time"
 )
 
 func findDatacenterPath(ctx context.Context, client *vim25.Client, objectRef vim25types.ManagedObjectReference, logger logrus.FieldLogger) (string, error) {
@@ -125,19 +121,37 @@ func findHostsOfNodeVMs(ctx context.Context, client *vim25.Client, config *rest.
 }
 
 func findSharedDatastoresFromAllNodeVMs(ctx context.Context, client *vim25.Client, config *rest.Config, logger logrus.FieldLogger) ([]vim25types.ManagedObjectReference, error) {
-	finder := find.NewFinder(client)
-
 	hosts, err := findHostsOfNodeVMs(ctx, client, config, logger)
 	if err != nil {
 		logger.WithError(err).Error("Failed to find hosts of all node VMs")
 		return nil, err
 	}
-	nHosts := len(hosts)
-	if nHosts <= 0 {
-		logger.WithError(err).Error("No hosts can be found for node VMs")
+
+	if len(hosts) <= 0 {
 		return nil, errors.New("No hosts can be found for node VMs")
 	}
 
+	return findAccessibleDatastoresFromHosts(ctx, client, hosts, nil, logger)
+}
+
+func hasDatastoreType(items []vim25types.HostFileSystemVolumeFileSystemType, val vim25types.HostFileSystemVolumeFileSystemType) bool {
+	// assume it has everything if items is nil or empty
+	if items == nil || len(items) == 0 {
+		return true
+	}
+
+	for _, item := range items {
+		if item == val {
+			return true
+		}
+	}
+
+	return false
+}
+
+func findAccessibleDatastoresFromHosts(ctx context.Context, client *vim25.Client, hosts []vim25types.ManagedObjectReference,
+	expectedDsTypes []vim25types.HostFileSystemVolumeFileSystemType, logger logrus.FieldLogger) ([]vim25types.ManagedObjectReference, error) {
+	// get all datacenter paths given the input hosts
 	dcPathMap := make(map[string]bool)
 	for _, host := range hosts {
 		dcPath, err := findDatacenterPath(ctx, client, host.Reference(), logger)
@@ -148,6 +162,8 @@ func findSharedDatastoresFromAllNodeVMs(ctx context.Context, client *vim25.Clien
 		dcPathMap[dcPath] = true
 	}
 
+	// find all datastores from all datacenters
+	finder := find.NewFinder(client)
 	var dss []*object.Datastore
 	for dcPath, _ := range dcPathMap {
 		path := fmt.Sprintf("%v/datastore/...", dcPath)
@@ -164,11 +180,18 @@ func findSharedDatastoresFromAllNodeVMs(ctx context.Context, client *vim25.Clien
 		dss = append(dss, dssPerDC...)
 	}
 
+	// get a list of datastores that are accessible from all input hosts
+	nHosts := len(hosts)
 	var dsList []vim25types.ManagedObjectReference
 	for _, ds := range dss {
 		dsType, err := ds.Type(ctx)
 		if err != nil {
 			logger.WithError(err).Warnf("Failed to get type of datastore %v", ds.Reference())
+			continue
+		}
+
+		if !hasDatastoreType(expectedDsTypes, dsType) {
+			logger.Debugf("datastore type %v is filtered out since it is out of the expected datastore types %v", dsType, expectedDsTypes)
 			continue
 		}
 
@@ -229,7 +252,7 @@ func findSharedDatastoresFromAllNodeVMs(ctx context.Context, client *vim25.Clien
 		}
 	}
 
-	logger.Debugf("Shared datastores from all node VMs: %v", dsList)
+	logger.Debugf("Shared datastores from all the given hosts %v: %v", hosts, dsList)
 	return dsList, nil
 }
 
@@ -412,54 +435,69 @@ func CreateCnsVolumeInCluster(ctx context.Context, vcConfig *vsphere.VirtualCent
 	return NewIDFromString(volumeId), nil
 }
 
-func GetCreateSpec(name string, capacity int64, datastore vim25types.ManagedObjectReference, profile []vim25types.BaseVirtualMachineProfileSpec) vim25types.VslmCreateSpec {
-	keepAfterDeleteVm := true
-	return vim25types.VslmCreateSpec{
-		Name:              name,
-		KeepAfterDeleteVm: &keepAfterDeleteVm,
-		BackingSpec: &vim25types.VslmCreateSpecDiskFileBackingSpec{
-			VslmCreateSpecBackingSpec: vim25types.VslmCreateSpecBackingSpec{
-				Datastore: datastore,
-			},
-		},
-		CapacityInMB: capacity,
-		Profile:      profile,
+func pickOneAccessibleDatastoreFromHosts(ctx context.Context, client *vim25.Client, hosts []vim25types.ManagedObjectReference,
+	expectedDsTypes []vim25types.HostFileSystemVolumeFileSystemType, logger logrus.FieldLogger) (vim25types.ManagedObjectReference, error) {
+	datastores, err := findAccessibleDatastoresFromHosts(ctx, client, hosts, expectedDsTypes, logger)
+	if err != nil || len(datastores) <= 0 {
+		errorMsg := fmt.Sprintf("Failed to find any datastore that is accessible from the hosts %v", hosts)
+		logger.Error(errorMsg)
+		if err == nil {
+			err = errors.New(errorMsg)
+		} else {
+			err = errors.Wrap(err, errorMsg)
+		}
+		return vim25types.ManagedObjectReference{}, err
 	}
+
+	// pick the first datastores in the list
+	return datastores[0], nil
 }
 
-func GetRandomName(prefix string, nDigits int) string {
-	rand.Seed(time.Now().UnixNano())
-	num := rand.Int63n(int64(math.Pow10(nDigits)))
-	numstr := strconv.FormatInt(num, 10)
-	return fmt.Sprintf("%s-%s", prefix, numstr)
+func pickOneHost(ctx context.Context, client *vim25.Client, logger logrus.FieldLogger) (vim25types.ManagedObjectReference, error) {
+	hosts, err := findAllHosts(ctx, client, logger)
+	if err != nil || len(hosts) <= 0 {
+		errorMsg := fmt.Sprintf("Failed to find any hosts from vCenter %v", client.URL().Host)
+		logger.Error(errorMsg)
+		if err == nil {
+			err = errors.New(errorMsg)
+		} else {
+			err = errors.Wrap(err, errorMsg)
+		}
+		return vim25types.ManagedObjectReference{}, err
+	}
+	// pick the first hosts in the list
+	return hosts[0], nil
 }
 
-func CreateIVDUtil(ctx context.Context, ivdPETM *IVDProtectedEntityTypeManager, spec vim25types.VslmCreateSpec) (vim25types.ID, error){
-	vslmTask, err := ivdPETM.vslmManager.CreateDisk(ctx, spec)
+func findAllHosts(ctx context.Context, client *vim25.Client, logger logrus.FieldLogger) ([]vim25types.ManagedObjectReference, error) {
+	finder := find.NewFinder(client)
+
+	dcs, err := finder.DatacenterList(ctx, "*")
 	if err != nil {
-		return vim25types.ID{}, errors.New("Failed to create task for CreateDisk invocation")
+		logger.WithError(err).Error("Failed to find the list of data centers in VC")
+		return nil, err
 	}
 
-	taskResult, err := vslmTask.Wait(ctx, waitTime)
-	if err != nil {
-		return vim25types.ID{}, errors.New("Failed at waiting for the CreateDisk invocation")
-	}
-	vStorageObject := taskResult.(vim25types.VStorageObject)
+	var hostList []vim25types.ManagedObjectReference
+	for _, dc := range dcs {
+		path := fmt.Sprintf("%v/host/...", dc.InventoryPath)
+		hosts, err := finder.HostSystemList(ctx, path)
+		if err != nil {
+			_, ok := err.(*find.NotFoundError)
+			if ok {
+				logger.Warnf("No Hosts can be found in data center, %v. Skip it.", dc.InventoryPath)
+				continue
+			}
+			logger.WithError(err).Errorf("Failed to find the list of Hosts in a data center, %v", dc.InventoryPath)
+			return nil, err
+		}
 
-	return vStorageObject.Config.Id, nil
+		for _, host := range hosts {
+			hostList = append(hostList, host.Reference())
+		}
+	}
+
+	return hostList, nil
 }
 
-func DeleteIVDUtil(ctx context.Context, ivdPETM *IVDProtectedEntityTypeManager, id vim25types.ID) error {
-	vslmTask, err := ivdPETM.vslmManager.Delete(ctx, id)
-	if err != nil {
-		return errors.Errorf("Failed to create task for DeleteDisk invocation with err: %v", err)
-	}
-
-	_, err = vslmTask.Wait(ctx, waitTime)
-	if err != nil {
-		return errors.Errorf("Failed at waiting for the DeleteDisk invocation with err: %v", err)
-	}
-	
-	return nil
-}
 

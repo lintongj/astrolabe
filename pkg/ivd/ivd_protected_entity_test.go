@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/kr/pretty"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/vmware-tanzu/astrolabe/pkg/astrolabe"
 	"github.com/vmware-tanzu/astrolabe/pkg/common/vsphere"
@@ -34,6 +36,9 @@ import (
 	"github.com/vmware/govmomi/vim25/mo"
 	"github.com/vmware/govmomi/vim25/soap"
 	"github.com/vmware/govmomi/vim25/types"
+	"math"
+	"math/rand"
+	"net/url"
 	"os"
 	"reflect"
 	"strconv"
@@ -80,50 +85,35 @@ func TestSnapshotOpsUnderRaceCondition(t *testing.T) {
 	formatter.FullTimestamp = true
 	logger.SetFormatter(formatter)
 	logger.SetLevel(logrus.DebugLevel)
-	s3Config := astrolabe.S3Config{
-		URLBase: "VOID_URL",
-	}
 
-	params := make(map[string]interface{})
-	params[vsphere.HostVcParamKey] = vcUrl.Host
-	params[vsphere.PortVcParamKey] = vcUrl.Port()
-	params[vsphere.UserVcParamKey] = vcUrl.User.Username()
-	password, _ := vcUrl.User.Password()
-	params[vsphere.PasswordVcParamKey] = password
-	params[vsphere.InsecureFlagVcParamKey] = true
-	params[vsphere.ClusterVcParamKey] = ""
-
-	ivdPETM, err := NewIVDProtectedEntityTypeManager(params, s3Config, logger)
+	params := getIVDConfigParams(vcUrl)
+	ivdPETM, err := NewIVDProtectedEntityTypeManager(params, astrolabe.S3Config{URLBase: "VOID_URL"}, logger)
 	if err != nil {
 		t.Skipf("Failed to get a new ivd PETM: %v", err)
 	}
 
 	virtualCenter := ivdPETM.vcenter
 
+	vmHost, err := pickOneHost(ctx, virtualCenter.Client.Client, logger)
+	if err != nil {
+		t.Skipf("Failed to find a host for VM creation with err: %v", err)
+	}
+
 	// #1: Create a few of IVDs
-	datastoreType := types.HostFileSystemVolumeFileSystemTypeVsan
-	datastores, err := findAllAccessibleDatastoreByType(ctx, virtualCenter.Client.Client, datastoreType)
-	if err != nil || len(datastores) <= 0 {
-		t.Skipf("Failed to find any all accessible datastore with type, %v", datastoreType)
+	ivdDs, err := pickOneAccessibleDatastoreFromHosts(ctx, virtualCenter.Client.Client, []types.ManagedObjectReference{vmHost}, nil, logger)
+	if err != nil {
+		t.Skipf("Failed to find an accessible datastore from VM host %v with err: %v", vmHost, err)
 	}
 
 	logger.Infof("Step 1: Creating %v IVDs", nIVDs)
-	ivdDs := datastores[0]
 	var ivdIds []types.ID
 	for i := 0; i < nIVDs; i++ {
-		createSpec := GetCreateSpec(GetRandomName("ivd", 5), 10, ivdDs, nil)
-		vslmTask, err := ivdPETM.vslmManager.CreateDisk(ctx, createSpec)
+		createSpec := getCreateSpec(getRandomName("ivd", 6), 50, ivdDs, nil)
+		diskID, err := createDisk(ctx, ivdPETM, createSpec, logger)
 		if err != nil {
-			t.Skipf("Failed to create task for CreateDisk invocation")
+			t.Skipf("Failed to create IVD with err: %v", err)
 		}
-
-		taskResult, err := vslmTask.Wait(ctx, waitTime)
-		if err != nil {
-			t.Skipf("Failed at waiting for the CreateDisk invocation")
-		}
-		vStorageObject := taskResult.(types.VStorageObject)
-		ivdIds = append(ivdIds, vStorageObject.Config.Id)
-		logger.Debugf("IVD, %v, created", vStorageObject.Config.Id.Id)
+		ivdIds = append(ivdIds, diskID)
 	}
 
 	if ivdIds == nil {
@@ -132,73 +122,44 @@ func TestSnapshotOpsUnderRaceCondition(t *testing.T) {
 
 	defer func() {
 		for i := 0; i < nIVDs; i++ {
-			vslmTask, err := ivdPETM.vslmManager.Delete(ctx, ivdIds[i])
-			if err != nil {
-				t.Skipf("Failed to create task for DeleteDisk invocation with err: %v", err)
+			if err := deleteDisk(ctx, ivdPETM, ivdIds[i], logger); err != nil {
+				t.Skipf("Failed to delete IVD %v with err: %v", ivdIds[i].Id, err)
 			}
-
-			_, err = vslmTask.Wait(ctx, waitTime)
-			if err != nil {
-				t.Skipf("Failed at waiting for the DeleteDisk invocation with err: %v", err)
-			}
-			logger.Debugf("IVD, %v, deleted", ivdIds[i].Id)
 		}
 	}()
 
 	// #2: Create a VM
-	logger.Info("Step 2: Creating a VM")
-	hosts, err := findAllHosts(ctx, virtualCenter.Client.Client)
-	if err != nil || len(hosts) <= 0 {
-		t.Skipf("Failed to find all available hosts")
-	}
-	vmHost := hosts[0]
-
-	pc := property.DefaultCollector(virtualCenter.Client.Client)
-	var ivdDsMo mo.Datastore
-	err = pc.RetrieveOne(ctx, ivdDs.Reference(), []string{"name"}, &ivdDsMo)
-	if err != nil {
-		t.Skipf("Failed to get datastore managed object with err: %v", err)
-	}
-
-	logger.Debugf("Creating VM on host: %v, and datastore: %v", vmHost.Reference(), ivdDsMo.Name)
-	vmName := GetRandomName("vm", 5)
-	vmMo, err := vmCreate(ctx, virtualCenter.Client.Client, vmHost.Reference(), vmName, ivdDsMo.Name, nil, logger)
+	logger.Info("Step 1: Creating a VM")
+	vmMo, err := createDummyVm(ctx, virtualCenter.Client.Client, vmHost, nil, logger)
 	if err != nil {
 		t.Skipf("Failed to create a VM with err: %v", err)
 	}
 	vmRef := vmMo.Reference()
-	logger.Debugf("VM, %v(%v), created on host: %v, and datastore: %v", vmRef, vmName, vmHost, ivdDsMo.Name)
 	defer func() {
-		vimTask, err := vmMo.Destroy(ctx)
-		if err != nil {
-			t.Skipf("Failed to destroy the VM %v with err: %v", vmName, err)
+		if err := deleteVm(ctx, virtualCenter.Client.Client, vmRef, nil); err != nil {
+			t.Skipf("Failed to delete VM %v with err: %v", vmRef, err)
 		}
-		err = vimTask.Wait(ctx)
-		if err != nil {
-			t.Skipf("Failed at waiting for the destroy of VM %v with err: %v", vmName, err)
-		}
-		logger.Debugf("VM, %v(%v), destroyed", vmRef, vmName)
 	}()
 
 	// #3: Attach those IVDs to the VM
-	logger.Infof("Step 3: Attaching IVDs to VM %v", vmName)
+	logger.Infof("Step 3: Attaching IVDs to VM %v", vmRef)
 	for i := 0; i < nIVDs; i++ {
-		err = vmAttachDiskWithWait(ctx, virtualCenter.Client.Client, vmRef.Reference(), ivdIds[i], ivdDs.Reference())
+		err = attachDisk(ctx, virtualCenter.Client.Client, vmRef.Reference(), ivdIds[i], ivdDs.Reference(), nil)
 		if err != nil {
-			t.Skipf("Failed to attach ivd, %v, to, VM, %v with err: %v", ivdIds[i].Id, vmName, err)
+			t.Skipf("Failed to attach ivd, %v, to, VM, %v with err: %v", ivdIds[i].Id, vmRef, err)
 		}
 
-		logger.Debugf("IVD, %v, attached to VM, %v", ivdIds[i].Id, vmName)
+		logger.Debugf("IVD, %v, attached to VM, %v", ivdIds[i].Id, vmRef)
 	}
 
 	defer func() {
 		for i := 0; i < nIVDs; i++ {
-			err = vmDetachDiskWithWait(ctx, virtualCenter.Client.Client, vmRef.Reference(), ivdIds[i])
+			err = detachDisk(ctx, virtualCenter.Client.Client, vmRef.Reference(), ivdIds[i], nil)
 			if err != nil {
-				t.Skipf("Failed to detach ivd, %v, to, VM, %v with err: %v", ivdIds[i].Id, vmName, err)
+				t.Skipf("Failed to detach ivd, %v, to, VM, %v with err: %v", ivdIds[i].Id, vmRef, err)
 			}
 
-			logger.Debugf("IVD, %v, detached from VM, %v", ivdIds[i].Id, vmName)
+			logger.Debugf("IVD, %v, detached from VM, %v", ivdIds[i].Id, vmRef)
 		}
 	}()
 
@@ -345,62 +306,52 @@ func createSnapshotLocked(mutex *sync.Mutex, ctx context.Context, ivdPE astrolab
 	return peSnapID, nil
 }
 
-func findAllHosts(ctx context.Context, client *vim25.Client) ([]types.ManagedObjectReference, error) {
-	finder := find.NewFinder(client)
-
-	hosts, err := finder.HostSystemList(ctx, "*")
-	if err != nil {
-		return nil, err
+func getCreateSpec(name string, capacity int64, datastore types.ManagedObjectReference, profile []types.BaseVirtualMachineProfileSpec) types.VslmCreateSpec {
+	keepAfterDeleteVm := true
+	return types.VslmCreateSpec{
+		Name:              name,
+		KeepAfterDeleteVm: &keepAfterDeleteVm,
+		BackingSpec: &types.VslmCreateSpecDiskFileBackingSpec{
+			VslmCreateSpecBackingSpec: types.VslmCreateSpecBackingSpec{
+				Datastore: datastore,
+			},
+		},
+		CapacityInMB: capacity,
+		Profile:      profile,
 	}
-
-	var hostList []types.ManagedObjectReference
-	for _, host := range hosts {
-		hostList = append(hostList, host.Reference())
-	}
-
-	return hostList, nil
 }
 
-func findAllAccessibleDatastoreByType(ctx context.Context, client *vim25.Client, datastoreType types.HostFileSystemVolumeFileSystemType) ([]types.ManagedObjectReference, error) {
-	finder := find.NewFinder(client)
-
-	hosts, err := findAllHosts(ctx, client)
-	if err != nil {
-		return nil, err
-	}
-	nHosts := len(hosts)
-
-	dss, err := finder.DatastoreList(ctx, "*")
-	if err != nil {
-		return nil, err
-	}
-
-	var dsList []types.ManagedObjectReference
-	for _, ds := range dss {
-		attachedHosts, err := ds.AttachedHosts(ctx)
-		if err != nil {
-			fmt.Printf("Failed to get all the attached hosts of datastore %v\n", ds.Name())
-			continue
-		}
-		if nHosts != len(attachedHosts) {
-			continue
-		}
-
-		dsType, err := ds.Type(ctx)
-		if err != nil {
-			fmt.Printf("Failed to get type of datastore %v\n", ds.Name())
-			continue
-		}
-		if dsType == datastoreType {
-			dsList = append(dsList, ds.Reference())
-			break
-		}
-	}
-
-	return dsList, nil
+func getRandomName(prefix string, nDigits int) string {
+	rand.Seed(time.Now().UnixNano())
+	num := rand.Int63n(int64(math.Pow10(nDigits)))
+	numstr := strconv.FormatInt(num, 10)
+	return fmt.Sprintf("%s-%s", prefix, numstr)
 }
 
-func vmAttachDisk(ctx context.Context, client *vim25.Client, vm types.ManagedObjectReference, diskId types.ID, datastore types.ManagedObjectReference) (*object.Task, error) {
+func getEncryptionProfileId(ctx context.Context, client *vim25.Client) (string, error) {
+	pbmClient, err := pbm.NewClient(ctx, client)
+	if err != nil {
+		return "", err
+	}
+
+	encryptionProfileName := "VM Encryption Policy"
+	return pbmClient.ProfileIDByName(ctx, encryptionProfileName)
+}
+
+func getProfileSpecs(profileId string) []types.BaseVirtualMachineProfileSpec {
+	var profileSpecs []types.BaseVirtualMachineProfileSpec
+	if profileId == "" {
+		profileSpecs = append(profileSpecs, &types.VirtualMachineDefaultProfileSpec{})
+	} else {
+		profileSpecs = append(profileSpecs, &types.VirtualMachineDefinedProfileSpec{
+			VirtualMachineProfileSpec: types.VirtualMachineProfileSpec{},
+			ProfileId:                 profileId,
+		})
+	}
+	return profileSpecs
+}
+
+func attachDiskAsync(ctx context.Context, client *vim25.Client, vm types.ManagedObjectReference, diskId types.ID, datastore types.ManagedObjectReference) (*object.Task, error) {
 	req := types.AttachDisk_Task{
 		This:       vm.Reference(),
 		DiskId:     diskId,
@@ -416,8 +367,9 @@ func vmAttachDisk(ctx context.Context, client *vim25.Client, vm types.ManagedObj
 	return object.NewTask(client, res.Returnval), nil
 }
 
-func vmAttachDiskWithWait(ctx context.Context, client *vim25.Client, vm types.ManagedObjectReference, diskId types.ID, datastore types.ManagedObjectReference) error {
-	vimTask, err := vmAttachDisk(ctx, client, vm, diskId, datastore)
+func attachDisk(ctx context.Context, client *vim25.Client, vmRef types.ManagedObjectReference, diskId types.ID, datastore types.ManagedObjectReference, logger logrus.FieldLogger) error {
+	logger.Debugf("Attaching the disk %v to the VM %v", diskId.Id, vmRef)
+	vimTask, err := attachDiskAsync(ctx, client, vmRef, diskId, datastore)
 	if err != nil {
 		return err
 	}
@@ -427,10 +379,11 @@ func vmAttachDiskWithWait(ctx context.Context, client *vim25.Client, vm types.Ma
 		return err
 	}
 
+	logger.Debugf("Disk %v is attached to the VM %v", diskId.Id, vmRef)
 	return nil
 }
 
-func vmDetachDisk(ctx context.Context, client *vim25.Client, vm types.ManagedObjectReference, diskId types.ID) (*object.Task, error) {
+func detachDiskAsync(ctx context.Context, client *vim25.Client, vm types.ManagedObjectReference, diskId types.ID) (*object.Task, error) {
 	req := types.DetachDisk_Task{
 		This:   vm.Reference(),
 		DiskId: diskId,
@@ -444,8 +397,9 @@ func vmDetachDisk(ctx context.Context, client *vim25.Client, vm types.ManagedObj
 	return object.NewTask(client, res.Returnval), nil
 }
 
-func vmDetachDiskWithWait(ctx context.Context, client *vim25.Client, vm types.ManagedObjectReference, diskId types.ID) error {
-	vimTask, err := vmDetachDisk(ctx, client, vm, diskId)
+func detachDisk(ctx context.Context, client *vim25.Client, vmRef types.ManagedObjectReference, diskId types.ID, logger logrus.FieldLogger) error {
+	logger.Debugf("Detaching the disk %v from the VM %v", diskId.Id, vmRef)
+	vimTask, err := detachDiskAsync(ctx, client, vmRef, diskId)
 	if err != nil {
 		return err
 	}
@@ -455,15 +409,37 @@ func vmDetachDiskWithWait(ctx context.Context, client *vim25.Client, vm types.Ma
 		return err
 	}
 
+	logger.Debugf("Disk %v is detached from the VM %v", diskId.Id, vmRef)
 	return nil
 }
 
-func vmCreate(ctx context.Context, client *vim25.Client, vmHost types.ManagedObjectReference, vmName string, dsName string, vmProfile []types.BaseVirtualMachineProfileSpec, logger logrus.FieldLogger) (*object.VirtualMachine, error) {
-	finder := find.NewFinder(client)
+func createDummyVm(ctx context.Context, client *vim25.Client, vmHost types.ManagedObjectReference, vmProfile []types.BaseVirtualMachineProfileSpec, logger logrus.FieldLogger) (*object.VirtualMachine, error) {
+	logger.Debugf("Creating a dummy VM on host %v", vmHost)
+
+	// pick an accessible datastore from the VM host for VM home directory.
+	vmDs, err := pickOneAccessibleDatastoreFromHosts(ctx, client, []types.ManagedObjectReference{vmHost}, nil, logger)
+	if err != nil {
+		return nil, err
+	}
+
+	// retrieve the managed object of VM datastore from vCenter property collector
+	pc := property.DefaultCollector(client)
+	var vmDsMo mo.Datastore
+	err = pc.RetrieveOne(ctx, vmDs.Reference(), []string{"name"}, &vmDsMo)
+	if err != nil {
+		errorMsg := fmt.Sprintf("Failed to get the managed object of datastore %v", vmDs)
+		logger.Errorf(errorMsg)
+		return nil, errors.Wrap(err, errorMsg)
+	}
+
+	logger.Debugf("Creating VM on host: %v, and datastore: %v(%v)", vmHost.Reference(), vmDsMo.Name, vmDs.Reference())
+	vmName := getRandomName("vm", 6)
+
+	// prepare for VM config spec
 	virtualMachineConfigSpec := types.VirtualMachineConfigSpec{
 		Name: vmName,
 		Files: &types.VirtualMachineFileInfo{
-			VmPathName: "[" + dsName + "]",
+			VmPathName: "[" + vmDsMo.Name + "]",
 		},
 		Annotation: "Quick Dummy",
 		GuestId:    "otherLinux64Guest",
@@ -487,6 +463,8 @@ func vmCreate(ctx context.Context, client *vim25.Client, vmHost types.ManagedObj
 		},
 		VmProfile: vmProfile,
 	}
+
+	finder := find.NewFinder(client)
 	defaultFolder, err := finder.DefaultFolder(ctx)
 	defaultResourcePool, err := finder.DefaultResourcePool(ctx)
 	vmHostSystem := object.NewHostSystem(client, vmHost)
@@ -503,8 +481,130 @@ func vmCreate(ctx context.Context, client *vim25.Client, vmHost types.ManagedObj
 	}
 
 	vmRef := vmTaskInfo.Result.(object.Reference)
-	nodeVM := object.NewVirtualMachine(client, vmRef.Reference())
-	return nodeVM, nil
+	vmMo := object.NewVirtualMachine(client, vmRef.Reference())
+
+	logger.Debugf("VM %v(%v) is created on host %v and datastore %v(%v)", vmName, vmMo.Reference(), vmHost, vmDsMo.Name, vmDs.Reference())
+	return vmMo, nil
+}
+
+
+func deleteVm(ctx context.Context, client *vim25.Client, vmRef types.ManagedObjectReference, logger logrus.FieldLogger) error {
+	vmMo := object.NewVirtualMachine(client, vmRef)
+
+	var err error
+	var vmName string
+	if vmName, err = vmMo.ObjectName(ctx); err != nil {
+		return errors.Wrapf(err, "deleteVm: Failed to get VM name from VM reference %v", vmRef)
+	}
+	logger.Debugf("Deleting the VM %v(%v)", vmName, vmRef)
+
+	vimTask, err := vmMo.Destroy(ctx)
+	if err != nil {
+		return errors.Wrapf(err, "Failed to destroy the VM %v(%v)", vmName, vmRef)
+	}
+	err = vimTask.Wait(ctx)
+	if err != nil {
+		return errors.Wrapf(err,"Failed at waiting for the destroy of VM %v(%v)", vmName, vmRef)
+	}
+
+	logger.Debugf("VM %v(%v) is deleted", vmName, vmRef)
+	return nil
+}
+
+func powerOnVm(ctx context.Context, client *vim25.Client, vmRef types.ManagedObjectReference, logger logrus.FieldLogger) error {
+	vmMo := object.NewVirtualMachine(client, vmRef)
+
+	var err error
+	var vmName string
+	if vmName, err = vmMo.ObjectName(ctx); err != nil {
+		return errors.Wrapf(err, "powerOnVm: Failed to get VM name from VM reference %v", vmRef)
+	}
+	logger.Debugf("Powering on the VM %v(%v)", vmName, vmRef)
+
+	vimTask, err := vmMo.PowerOn(ctx)
+	if err != nil {
+		return errors.Wrapf(err, "Failed to create a PowerOn task for VM %v(%v)", vmName, vmRef)
+	}
+	err = vimTask.Wait(ctx)
+	if err != nil {
+		return errors.Wrapf(err, "Failed at waiting for the PowerOn task for VM %v(%v)", vmName, vmRef)
+	}
+
+	logger.Debugf("VM %v(%v) is powered on", vmName, vmRef)
+	return nil
+}
+
+func powerOffVm(ctx context.Context, client *vim25.Client, vmRef types.ManagedObjectReference, logger logrus.FieldLogger) error {
+	vmMo := object.NewVirtualMachine(client, vmRef)
+
+	var err error
+	var vmName string
+	if vmName, err = vmMo.ObjectName(ctx); err != nil {
+		return errors.Wrapf(err, "Failed to get VM name from VM reference %v", vmRef)
+	}
+	logger.Debugf("Powering off the VM %v(%v)", vmName, vmRef)
+
+	vimTask, err := vmMo.PowerOff(ctx)
+	if err != nil {
+		return errors.Wrapf(err, "Failed to create a PowerOff task for VM %v(%v)", vmName, vmRef)
+	}
+	err = vimTask.Wait(ctx)
+	if err != nil {
+		return errors.Wrapf(err, "Failed at waiting for the PowerOff task for VM %v(%v)", vmName, vmRef)
+	}
+
+	logger.Debugf("VM %v(%v) is powered off", vmName, vmRef)
+	return nil
+}
+
+func createDisk(ctx context.Context, ivdPETM *IVDProtectedEntityTypeManager, createSpec types.VslmCreateSpec, logger logrus.FieldLogger) (types.ID, error){
+	logger.Debugf("Creating an IVD disk with spec: %v", pretty.Sprint(createSpec))
+	vslmTask, err := ivdPETM.vslmManager.CreateDisk(ctx, createSpec)
+	if err != nil {
+		return types.ID{}, errors.Wrap(err, "Failed to create task for CreateDisk invocation")
+	}
+
+	taskResult, err := vslmTask.Wait(ctx, waitTime)
+	if err != nil {
+		return types.ID{}, errors.Wrap(err,"Failed at waiting for the CreateDisk invocation")
+	}
+	vStorageObject := taskResult.(types.VStorageObject)
+	diskID := vStorageObject.Config.Id
+	logger.Debugf("IVD disk, %v, is created", diskID.Id)
+	return diskID, nil
+}
+
+func deleteDisk(ctx context.Context, ivdPETM *IVDProtectedEntityTypeManager, id types.ID, logger logrus.FieldLogger) error {
+	logger.Debugf("Deleting the IVD disk %v", id.Id)
+	vslmTask, err := ivdPETM.vslmManager.Delete(ctx, id)
+	if err != nil {
+		return errors.Wrap(err, "Failed to create task for DeleteDisk invocation")
+	}
+
+	_, err = vslmTask.Wait(ctx, waitTime)
+	if err != nil {
+		return errors.Wrap(err,"Failed at waiting for the DeleteDisk invocation")
+	}
+
+	logger.Debugf("IVD, %v, is deleted", id.Id)
+	return nil
+}
+
+func getIVDConfigParams(vcUrl *url.URL) map[string]interface{} {
+	params := make(map[string]interface{})
+	params[vsphere.HostVcParamKey] = vcUrl.Host
+	if vcUrl.Port() == "" {
+		params[vsphere.PortVcParamKey] = "443"
+	} else {
+		params[vsphere.PortVcParamKey] = vcUrl.Port()
+	}
+	params[vsphere.UserVcParamKey] = vcUrl.User.Username()
+	password, _ := vcUrl.User.Password()
+	params[vsphere.PasswordVcParamKey] = password
+	params[vsphere.InsecureFlagVcParamKey] = "true"
+	params[vsphere.ClusterVcParamKey] = ""
+
+	return params
 }
 
 func TestBackupEncryptedIVD(t *testing.T) {
@@ -513,6 +613,14 @@ func TestBackupEncryptedIVD(t *testing.T) {
 	u, exist := os.LookupEnv("ASTROLABE_VC_URL")
 	if !exist {
 		t.Skipf("ASTROLABE_VC_URL is not set")
+	}
+
+	enableDebugLog := false
+	enableDebugLogStr, ok := os.LookupEnv("ENABLE_DEBUG_LOG")
+	if ok {
+		if res, _ := strconv.ParseBool(enableDebugLogStr); res {
+			enableDebugLog = true
+		}
 	}
 
 	vcUrl, err := soap.ParseURL(u)
@@ -526,155 +634,137 @@ func TestBackupEncryptedIVD(t *testing.T) {
 	formatter.TimestampFormat = time.RFC3339Nano
 	formatter.FullTimestamp = true
 	logger.SetFormatter(formatter)
-	logger.SetLevel(logrus.DebugLevel)
-	s3Config := astrolabe.S3Config{
-		URLBase: "VOID_URL",
+	if enableDebugLog {
+		logger.SetLevel(logrus.DebugLevel)
 	}
-	params := make(map[string]interface{})
-	params[vsphere.HostVcParamKey] = vcUrl.Host
-	params[vsphere.PortVcParamKey] = vcUrl.Port()
-	params[vsphere.UserVcParamKey] = vcUrl.User.Username()
-	password, _ := vcUrl.User.Password()
-	params[vsphere.PasswordVcParamKey] = password
-	params[vsphere.InsecureFlagVcParamKey] = true
-	params[vsphere.ClusterVcParamKey] = ""
 
-	ivdPETM, err := NewIVDProtectedEntityTypeManager(params, s3Config, logger)
+	// BEGIN: configuration options
+	// Use two IVDs in this test case if not explicitly specified
+	nIVDs := 2
+	nIVDsStr, ok := os.LookupEnv("NUM_OF_IVD")
+	if ok {
+		nIVDsInt, err := strconv.Atoi(nIVDsStr)
+		if err == nil && nIVDsInt > 0 && nIVDsInt <= MaxNumOfIVDs {
+			nIVDs = nIVDsInt
+		}
+	}
+
+	// Use Encryption
+	useEncryptedIVD := false
+	useEncryptionStr, ok := os.LookupEnv("USE_ENCRYPTED_IVD")
+	if ok {
+		if res, _ := strconv.ParseBool(useEncryptionStr); res {
+			useEncryptedIVD = true
+		}
+	}
+	logger.Debugf("Configuration options: numOfIVDs = %v, useEncryption=%v", nIVDs, useEncryptedIVD)
+	// END: configuration options
+
+	ivdPETM, err := NewIVDProtectedEntityTypeManager(getIVDConfigParams(vcUrl), astrolabe.S3Config{URLBase: "VOID_URL"}, logger)
 	if err != nil {
 		t.Skipf("Failed to get a new ivd PETM: %v", err)
 	}
-	virtualCenter := ivdPETM.vcenter
-	datastoreType := types.HostFileSystemVolumeFileSystemTypeVsan
-	datastores, err := findAllAccessibleDatastoreByType(ctx, virtualCenter.Client.Client, datastoreType)
-	if err != nil || len(datastores) <= 0 {
-		t.Skipf("Failed to find any all accessible datastore with type, %v", datastoreType)
+
+	if err := BackupIVDsUtil(t, ctx, ivdPETM, nIVDs, useEncryptedIVD, logger); err != nil {
+		t.Fatal(err)
 	}
-	vmDs := datastores[0]
-	ivdDs := datastores[len(datastores)-1]
-	encryptionProfileId, err := getEncryptionProfileId(ctx, virtualCenter.Client.Client)
+}
+
+func BackupIVDsUtil(t *testing.T, ctx context.Context, ivdPETM *IVDProtectedEntityTypeManager, nIVDs int, useEncryptedIVD bool, logger logrus.FieldLogger) error {
+	var err error
+	virtualCenter := ivdPETM.vcenter
+
+	var encryptionProfileId string
+	if useEncryptedIVD {
+		encryptionProfileId, err = getEncryptionProfileId(ctx, virtualCenter.Client.Client)
+		if err != nil {
+			t.Skipf("Failed to get encryption profile ID: %v", err)
+		}
+	}
+
+	// pick a host for VM creation
+	vmHost, err := pickOneHost(ctx, virtualCenter.Client.Client, logger)
 	if err != nil {
-		t.Skipf("Failed to get encryption profile ID: %v", err)
+		t.Skipf("Failed to find a host for VM creation with err: %v", err)
 	}
 
 	// #1: Create an encrypted VM
 	logger.Info("Step 1: Creating a VM")
-	hosts, err := findAllHosts(ctx, virtualCenter.Client.Client)
-	if err != nil || len(hosts) <= 0 {
-		t.Skipf("Failed to find all available hosts")
-	}
-	vmHost := hosts[0]
-
-	pc := property.DefaultCollector(virtualCenter.Client.Client)
-	var vmDsMo mo.Datastore
-	err = pc.RetrieveOne(ctx, vmDs.Reference(), []string{"name"}, &vmDsMo)
-	if err != nil {
-		t.Skipf("Failed to get datastore managed object with err: %v", err)
-	}
-
-	logger.Debugf("Creating VM on host: %v, and datastore: %v", vmHost.Reference(), vmDsMo.Name)
-	vmName := GetRandomName("vm", 5)
 	vmProfile := getProfileSpecs(encryptionProfileId)
-	vmMo, err := vmCreate(ctx, virtualCenter.Client.Client, vmHost.Reference(), vmName, vmDsMo.Name, vmProfile, logger)
+	vmMo, err := createDummyVm(ctx, virtualCenter.Client.Client, vmHost, vmProfile, logger)
 	if err != nil {
 		t.Skipf("Failed to create a VM with err: %v", err)
 	}
 	vmRef := vmMo.Reference()
-	logger.Debugf("VM, %v(%v), created on host: %v, and datastore: %v", vmRef, vmName, vmHost, vmDsMo.Name)
 	defer func() {
-		vimTask, err := vmMo.Destroy(ctx)
-		if err != nil {
-			t.Skipf("Failed to destroy the VM %v with err: %v", vmName, err)
+		if err := deleteVm(ctx, virtualCenter.Client.Client, vmRef, nil); err != nil {
+			t.Skipf("Failed to delete VM %v with err: %v", vmRef, err)
 		}
-		err = vimTask.Wait(ctx)
-		if err != nil {
-			t.Skipf("Failed at waiting for the destroy of VM %v with err: %v", vmName, err)
-		}
-		logger.Debugf("VM, %v(%v), destroyed", vmRef, vmName)
 	}()
 
 	// #2: Poweron the VM
 	logger.Info("Step 2: Powering on a VM")
-	vimTask, err := vmMo.PowerOn(ctx)
-	if err != nil {
-		t.Skipf("Failed to create a VM PowerOn task: %v", err)
+	if err := powerOnVm(ctx, virtualCenter.Client.Client, vmRef, nil); err != nil {
+		t.Skipf("Failed to power on the VM %v with err: %v", vmRef, err)
 	}
-	err = vimTask.Wait(ctx)
-	if err != nil {
-		t.Skipf("Failed at waiting for the PowerOn of VM %v with err: %v", vmName, err)
-	}
-	logger.Debugf("VM, %v(%v), powered on", vmRef, vmName)
+	//logger.Debugf("VM, %v(%v), powered on", vmRef, vmName)
 	defer func() {
-		vimTask, err := vmMo.PowerOff(ctx)
-		if err != nil {
-			t.Skipf("Failed to create a VM PowerOff task: %v", err)
+		if err := powerOffVm(ctx, virtualCenter.Client.Client, vmRef, nil); err != nil {
+			t.Skipf("Failed to power off the VM %v with err: %v", vmRef, err)
 		}
-		err = vimTask.Wait(ctx)
-		if err != nil {
-			t.Skipf("Failed at waiting for the PowerOff of VM %v with err: %v", vmName, err)
-		}
-		logger.Debugf("VM, %v(%v), powered off", vmRef, vmName)
+		//logger.Debugf("VM, %v(%v), powered off", vmRef, vmName)
 	}()
 
 	// #3: Create encrypted IVDs
-	nIVDs := 2
+
 	logger.Infof("Creating %v encrypted IVDs", nIVDs)
 	ivdProfile := vmProfile
+	ivdDs, err := pickOneAccessibleDatastoreFromHosts(ctx, virtualCenter.Client.Client, []types.ManagedObjectReference{vmHost}, nil, logger)
+	if err != nil {
+		t.Skipf("Failed to find an accessible datastore from VM host %v with err: %v", vmHost, err)
+	}
 
 	var ivdIds []types.ID
 	for i := 0; i < nIVDs; i++ {
-		createSpec := GetCreateSpec(GetRandomName("ivd", 5), 50, ivdDs, ivdProfile)
-		vslmTask, err := ivdPETM.vslmManager.CreateDisk(ctx, createSpec)
+		createSpec := getCreateSpec(getRandomName("ivd", 6), 50, ivdDs, ivdProfile)
+		diskID, err := createDisk(ctx, ivdPETM, createSpec, logger)
 		if err != nil {
-			t.Skipf("Failed to create task for CreateDisk invocation")
+			t.Skipf("Failed to create IVD with err: %v", err)
 		}
-
-		taskResult, err := vslmTask.Wait(ctx, waitTime)
-		if err != nil {
-			t.Skipf("Failed at waiting for the CreateDisk invocation")
-		}
-		vStorageObject := taskResult.(types.VStorageObject)
-		ivdIds = append(ivdIds, vStorageObject.Config.Id)
-		logger.Debugf("IVD, %v, created", vStorageObject.Config.Id.Id)
+		ivdIds = append(ivdIds, diskID)
 	}
 
 	if ivdIds == nil {
-		t.Skipf("Failed to create the list of ivds as expected")
+		t.Skipf("Failed to create a list of ivds as expected")
 	}
 
 	defer func() {
 		for i := 0; i < nIVDs; i++ {
-			vslmTask, err := ivdPETM.vslmManager.Delete(ctx, ivdIds[i])
-			if err != nil {
-				t.Skipf("Failed to create task for DeleteDisk invocation with err: %v", err)
+			if err := deleteDisk(ctx, ivdPETM, ivdIds[i], logger); err != nil {
+				t.Skipf("Failed to delete IVD %v with err: %v", ivdIds[i].Id, err)
 			}
-
-			_, err = vslmTask.Wait(ctx, waitTime)
-			if err != nil {
-				t.Skipf("Failed at waiting for the DeleteDisk invocation with err: %v", err)
-			}
-			logger.Debugf("IVD, %v, deleted", ivdIds[i].Id)
 		}
 	}()
 
 	// #4: Attach it to VM
-	logger.Infof("Step 4: Attaching IVDs to VM %v", vmName)
+	logger.Infof("Step 4: Attaching IVDs to VM %v", vmRef)
 	for i := 0; i < nIVDs; i++ {
-		err = vmAttachDiskWithWait(ctx, virtualCenter.Client.Client, vmRef.Reference(), ivdIds[i], ivdDs.Reference())
+		err = attachDisk(ctx, virtualCenter.Client.Client, vmRef.Reference(), ivdIds[i], ivdDs.Reference(), nil)
 		if err != nil {
-			t.Skipf("Failed to attach ivd, %v, to, VM, %v with err: %v", ivdIds[i].Id, vmName, err)
+			t.Skipf("Failed to attach ivd, %v, to, VM, %v with err: %v", ivdIds[i].Id, vmRef, err)
 		}
 
-		logger.Debugf("IVD, %v, attached to VM, %v", ivdIds[i].Id, vmName)
+		logger.Debugf("IVD, %v, attached to VM, %v", ivdIds[i].Id, vmRef)
 	}
 
 	defer func() {
 		for i := 0; i < nIVDs; i++ {
-			err = vmDetachDiskWithWait(ctx, virtualCenter.Client.Client, vmRef.Reference(), ivdIds[i])
+			err = detachDisk(ctx, virtualCenter.Client.Client, vmRef.Reference(), ivdIds[i], nil)
 			if err != nil {
-				t.Skipf("Failed to detach ivd, %v, to, VM, %v with err: %v", ivdIds[i].Id, vmName, err)
+				t.Skipf("Failed to detach ivd, %v, to, VM, %v with err: %v", ivdIds[i].Id, vmRef, err)
 			}
 
-			logger.Debugf("IVD, %v, detached from VM, %v", ivdIds[i].Id, vmName)
+			logger.Debugf("IVD, %v, detached from VM, %v", ivdIds[i].Id, vmRef)
 		}
 	}()
 	// #5: Backup the IVD
@@ -734,30 +824,9 @@ func TestBackupEncryptedIVD(t *testing.T) {
 			t.Fatalf("Failed to delete local IVD snapshot, %v: %v", snapPEID.GetSnapshotID(), err)
 		}
 	}
+	return err
 }
 
-func getProfileSpecs(profileId string) []types.BaseVirtualMachineProfileSpec {
-	var profileSpecs []types.BaseVirtualMachineProfileSpec
-	if profileId == "" {
-		profileSpecs = append(profileSpecs, &types.VirtualMachineDefaultProfileSpec{})
-	} else {
-		profileSpecs = append(profileSpecs, &types.VirtualMachineDefinedProfileSpec{
-			VirtualMachineProfileSpec: types.VirtualMachineProfileSpec{},
-			ProfileId:                 profileId,
-		})
-	}
-	return profileSpecs
-}
-
-func getEncryptionProfileId(ctx context.Context, client *vim25.Client) (string, error) {
-	pbmClient, err := pbm.NewClient(ctx, client)
-	if err != nil {
-		return "", err
-	}
-
-	encryptionProfileName := "VM Encryption Policy"
-	return pbmClient.ProfileIDByName(ctx, encryptionProfileName)
-}
 
 func setupPETM(typeName string, logger logrus.FieldLogger) (*s3repository.ProtectedEntityTypeManager, error) {
 	sess, err := session.NewSession(&aws.Config{
